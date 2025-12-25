@@ -98,7 +98,11 @@ class TrainingPipeline:
             n_states=self.config.N_STATES,
             sequence_length=self.config.SEQUENCE_LENGTH,
             lstm_units=self.config.LSTM_UNITS,
-            dropout_rate=self.config.DROPOUT_RATE
+            dense_units=self.config.DENSE_UNITS,
+            dropout_rate=self.config.DROPOUT_RATE,
+            l2_lambda=self.config.L2_LAMBDA,
+            use_batch_norm=self.config.USE_BATCH_NORM,
+            learning_rate=self.config.LEARNING_RATE
         )
         
         X_train, X_test, y_train, y_test = lstm_classifier.prepare_data(
@@ -114,7 +118,8 @@ class TrainingPipeline:
             X_test, y_test,
             epochs=self.config.EPOCHS,
             batch_size=self.config.BATCH_SIZE,
-            model_path=model_path
+            model_path=model_path,
+            use_class_weight=self.config.USE_CLASS_WEIGHT
         )
         
         # 评估模型
@@ -290,11 +295,15 @@ class TrainingPipeline:
         X = np.array(X)
         y = np.array(y)
         
-        # 执行增量训练
+        # 执行增量训练（带验证集和早停）
         lstm_classifier.incremental_train(
             X, y,
-            epochs=10,  # 增量训练使用较少的 epoch
-            batch_size=self.config.BATCH_SIZE
+            epochs=self.config.INCREMENTAL_EPOCHS,
+            batch_size=self.config.BATCH_SIZE,
+            learning_rate=self.config.INCREMENTAL_LEARNING_RATE,
+            validation_split=self.config.INCREMENTAL_VALIDATION_SPLIT,
+            early_stopping_patience=self.config.INCREMENTAL_EARLY_STOPPING_PATIENCE,
+            use_class_weight=self.config.USE_CLASS_WEIGHT
         )
         
         # 保存更新后的模型

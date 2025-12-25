@@ -43,10 +43,23 @@ class TrainingConfig:
     # ============ LSTM 配置 ============
     SEQUENCE_LENGTH = 64  # LSTM 输入序列长度
     LSTM_UNITS = [128, 64]  # LSTM 层配置
+    DENSE_UNITS = [64]  # 全连接层配置
     DROPOUT_RATE = 0.2
     EPOCHS = 50
     BATCH_SIZE = 32
     VALIDATION_SPLIT = 0.2
+    
+    # ============ 正则化配置 ============
+    L2_LAMBDA = 1e-4  # L2 正则化强度（权重衰减）; 过拟合严重 → 增大 (如 1e-3); 欠拟合 → 减小 (如 1e-5)
+    USE_BATCH_NORM = True  # 是否使用 BatchNormalization
+    LEARNING_RATE = 1e-3  # Adam 优化器学习率
+    USE_CLASS_WEIGHT = True  # 是否使用类权重（处理类别不平衡问题，让稀有状态的错误代价更高）
+    
+    # ============ 增量训练配置 ============
+    INCREMENTAL_EPOCHS = 10  # 增量训练轮数
+    INCREMENTAL_LEARNING_RATE = 1e-5  # 增量训练学习率（比完整训练小，避免破坏已学习的权重）
+    INCREMENTAL_VALIDATION_SPLIT = 0.2  # 增量训练验证集比例
+    INCREMENTAL_EARLY_STOPPING_PATIENCE = 3  # 增量训练早停耐心值（比完整训练小，更敏感）
     
     # ============ 训练调度配置 ============
     INCREMENTAL_TRAIN_TIMES = [

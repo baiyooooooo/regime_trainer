@@ -5,9 +5,9 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers, callbacks
+# 使用 keras.layers 和 keras.callbacks 而不是直接导入，避免 linter 警告
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
+# train_test_split 已移除，改用手动按时间顺序划分以避免数据泄露
 import pickle
 import logging
 from typing import Tuple, Dict
@@ -23,7 +23,11 @@ class LSTMRegimeClassifier:
         n_states: int = 6,
         sequence_length: int = 64,
         lstm_units: list = [128, 64],
-        dropout_rate: float = 0.2
+        dense_units: list = [64],
+        dropout_rate: float = 0.2,
+        l2_lambda: float = 1e-4,
+        use_batch_norm: bool = True,
+        learning_rate: float = 1e-3
     ):
         """
         初始化
@@ -32,12 +36,20 @@ class LSTMRegimeClassifier:
             n_states: 状态数量
             sequence_length: 输入序列长度
             lstm_units: LSTM 层单元数列表
+            dense_units: 全连接层单元数列表
             dropout_rate: Dropout 比率
+            l2_lambda: L2 正则化强度
+            use_batch_norm: 是否使用 BatchNormalization
+            learning_rate: Adam 优化器学习率
         """
         self.n_states = n_states
         self.sequence_length = sequence_length
         self.lstm_units = lstm_units
+        self.dense_units = dense_units
         self.dropout_rate = dropout_rate
+        self.l2_lambda = l2_lambda
+        self.use_batch_norm = use_batch_norm
+        self.learning_rate = learning_rate
         self.model = None
         self.scaler = None
         self.history = None
@@ -45,48 +57,97 @@ class LSTMRegimeClassifier:
     
     def build_model(self, n_features: int):
         """
-        构建 LSTM 模型
+        构建 LSTM 模型（带 BatchNorm 和 L2 正则化）
         
         Args:
             n_features: 输入特征数量
         """
         model = keras.Sequential()
         
-        # 第一层 LSTM
-        model.add(layers.LSTM(
+        # L2 正则化器
+        l2_reg = keras.regularizers.l2(self.l2_lambda) if self.l2_lambda > 0 else None
+        
+        # 第一层 LSTM（带正则化）
+        model.add(keras.layers.LSTM(
             self.lstm_units[0],
             input_shape=(self.sequence_length, n_features),
-            return_sequences=len(self.lstm_units) > 1
+            return_sequences=len(self.lstm_units) > 1,
+            kernel_regularizer=l2_reg,
+            recurrent_regularizer=l2_reg
         ))
-        model.add(layers.Dropout(self.dropout_rate))
+        if self.use_batch_norm:
+            model.add(keras.layers.BatchNormalization())
+        model.add(keras.layers.Dropout(self.dropout_rate))
         
         # 中间 LSTM 层
         for i in range(1, len(self.lstm_units) - 1):
-            model.add(layers.LSTM(self.lstm_units[i], return_sequences=True))
-            model.add(layers.Dropout(self.dropout_rate))
+            model.add(keras.layers.LSTM(
+                self.lstm_units[i], 
+                return_sequences=True,
+                kernel_regularizer=l2_reg,
+                recurrent_regularizer=l2_reg
+            ))
+            if self.use_batch_norm:
+                model.add(keras.layers.BatchNormalization())
+            model.add(keras.layers.Dropout(self.dropout_rate))
         
         # 最后一层 LSTM（如果有多层）
         if len(self.lstm_units) > 1:
-            model.add(layers.LSTM(self.lstm_units[-1]))
-            model.add(layers.Dropout(self.dropout_rate))
+            model.add(keras.layers.LSTM(
+                self.lstm_units[-1],
+                kernel_regularizer=l2_reg,
+                recurrent_regularizer=l2_reg
+            ))
+            if self.use_batch_norm:
+                model.add(keras.layers.BatchNormalization())
+            model.add(keras.layers.Dropout(self.dropout_rate))
         
-        # 全连接层
-        model.add(layers.Dense(64, activation='relu'))
-        model.add(layers.Dropout(self.dropout_rate))
+        # 全连接层（带正则化）
+        for units in self.dense_units:
+            model.add(keras.layers.Dense(
+                units, 
+                activation='relu',
+                kernel_regularizer=l2_reg
+            ))
+            if self.use_batch_norm:
+                model.add(keras.layers.BatchNormalization())
+            model.add(keras.layers.Dropout(self.dropout_rate))
         
         # 输出层
-        model.add(layers.Dense(self.n_states, activation='softmax'))
+        model.add(keras.layers.Dense(self.n_states, activation='softmax'))
         
-        # 编译模型
+        # 编译模型（使用配置的学习率）
+        optimizer = keras.optimizers.Adam(learning_rate=self.learning_rate)
         model.compile(
-            optimizer='adam',
+            optimizer=optimizer,
             loss='sparse_categorical_crossentropy',
             metrics=['accuracy']
         )
         
         self.model = model
-        logger.info(f"LSTM 模型已构建")
+        logger.info(f"LSTM 模型已构建 (BatchNorm={self.use_batch_norm}, L2={self.l2_lambda})")
         logger.info(f"\n{model.summary()}")
+    
+    def _create_sequences(
+        self, 
+        features_scaled: np.ndarray, 
+        labels: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        创建序列数据的辅助方法
+        
+        Args:
+            features_scaled: 标准化后的特征数组
+            labels: 标签数组
+            
+        Returns:
+            (X, y) - 序列特征和对应标签
+        """
+        X, y = [], []
+        for i in range(len(features_scaled) - self.sequence_length):
+            X.append(features_scaled[i:i+self.sequence_length])
+            y.append(labels[i+self.sequence_length])
+        return np.array(X), np.array(y)
     
     def prepare_data(
         self,
@@ -95,7 +156,7 @@ class LSTMRegimeClassifier:
         test_size: float = 0.2
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        准备训练数据
+        准备训练数据（修复数据泄露问题）
         
         Args:
             features: 特征 DataFrame
@@ -105,28 +166,32 @@ class LSTMRegimeClassifier:
         Returns:
             (X_train, X_test, y_train, y_test)
         """
-        # 标准化特征
-        self.scaler = StandardScaler()
-        features_scaled = self.scaler.fit_transform(features)
-        
         # 保存特征名称（用于增量训练时的特征对齐）
         self.feature_names_ = list(features.columns)
         
-        # 创建序列数据
-        X, y = [], []
-        for i in range(len(features_scaled) - self.sequence_length):
-            X.append(features_scaled[i:i+self.sequence_length])
-            y.append(labels[i+self.sequence_length])
+        # ============ 修复数据泄露：先划分，再标准化 ============
+        # 按时间顺序划分训练集和测试集（时间序列不能 shuffle）
+        split_idx = int(len(features) * (1 - test_size))
         
-        X = np.array(X)
-        y = np.array(y)
+        train_features = features.iloc[:split_idx]
+        test_features = features.iloc[split_idx:]
+        train_labels = labels[:split_idx]
+        test_labels = labels[split_idx:]
         
-        logger.info(f"序列数据形状: X={X.shape}, y={y.shape}")
+        logger.info(f"数据划分: 训练集 {len(train_features)} 行, 测试集 {len(test_features)} 行")
         
-        # 划分训练集和测试集
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=42, shuffle=False
-        )
+        # 只在训练集上 fit scaler（避免数据泄露）
+        self.scaler = StandardScaler()
+        train_scaled = self.scaler.fit_transform(train_features)
+        
+        # 用训练集的 scaler 参数 transform 测试集
+        test_scaled = self.scaler.transform(test_features)
+        
+        # 分别创建训练和测试的序列数据
+        X_train, y_train = self._create_sequences(train_scaled, train_labels)
+        X_test, y_test = self._create_sequences(test_scaled, test_labels)
+        
+        logger.info(f"序列数据形状: X_train={X_train.shape}, X_test={X_test.shape}")
         
         return X_train, X_test, y_train, y_test
     
@@ -139,7 +204,8 @@ class LSTMRegimeClassifier:
         epochs: int = 50,
         batch_size: int = 32,
         early_stopping: bool = True,
-        model_path: str = None
+        model_path: str = None,
+        use_class_weight: bool = True
     ) -> Dict:
         """
         训练模型
@@ -153,6 +219,7 @@ class LSTMRegimeClassifier:
             batch_size: 批次大小
             early_stopping: 是否使用早停
             model_path: 模型保存路径
+            use_class_weight: 是否使用类权重（处理类别不平衡）
             
         Returns:
             训练历史
@@ -160,12 +227,29 @@ class LSTMRegimeClassifier:
         if self.model is None:
             self.build_model(X_train.shape[2])
         
+        # ============ 计算类权重（处理类别不平衡） ============
+        class_weight_dict = None
+        if use_class_weight:
+            from sklearn.utils.class_weight import compute_class_weight
+            classes = np.unique(y_train)
+            class_weights = compute_class_weight(
+                class_weight='balanced',
+                classes=classes,
+                y=y_train
+            )
+            class_weight_dict = dict(zip(classes, class_weights))
+            
+            # 输出类别分布和权重信息
+            class_counts = np.bincount(y_train.astype(int))
+            logger.info(f"训练集类别分布: {class_counts}")
+            logger.info(f"类权重: {class_weight_dict}")
+        
         # 回调函数
         callback_list = []
         
         # 早停
         if early_stopping:
-            early_stop = callbacks.EarlyStopping(
+            early_stop = keras.callbacks.EarlyStopping(
                 monitor='val_loss',
                 patience=10,
                 restore_best_weights=True
@@ -173,7 +257,7 @@ class LSTMRegimeClassifier:
             callback_list.append(early_stop)
         
         # 学习率衰减
-        lr_scheduler = callbacks.ReduceLROnPlateau(
+        lr_scheduler = keras.callbacks.ReduceLROnPlateau(
             monitor='val_loss',
             factor=0.5,
             patience=5,
@@ -183,7 +267,7 @@ class LSTMRegimeClassifier:
         
         # 模型检查点
         if model_path:
-            checkpoint = callbacks.ModelCheckpoint(
+            checkpoint = keras.callbacks.ModelCheckpoint(
                 model_path,
                 monitor='val_accuracy',
                 save_best_only=True,
@@ -191,7 +275,7 @@ class LSTMRegimeClassifier:
             )
             callback_list.append(checkpoint)
         
-        # 训练
+        # 训练（添加类权重）
         logger.info("开始训练 LSTM 模型...")
         self.history = self.model.fit(
             X_train, y_train,
@@ -199,6 +283,7 @@ class LSTMRegimeClassifier:
             epochs=epochs,
             batch_size=batch_size,
             callbacks=callback_list,
+            class_weight=class_weight_dict,
             verbose=1
         )
         
@@ -209,38 +294,100 @@ class LSTMRegimeClassifier:
         X_new: np.ndarray,
         y_new: np.ndarray,
         epochs: int = 10,
-        batch_size: int = 32
+        batch_size: int = 32,
+        learning_rate: float = 1e-5,
+        validation_split: float = 0.2,
+        early_stopping_patience: int = 3,
+        use_class_weight: bool = True
     ):
         """
-        增量训练（在现有模型基础上继续训练）
+        增量训练（在现有模型基础上继续训练，带验证集和早停）
         
         Args:
             X_new: 新的训练数据
             y_new: 新的标签
             epochs: 训练轮数
             batch_size: 批次大小
+            learning_rate: 增量训练学习率（比完整训练小）
+            validation_split: 验证集比例
+            early_stopping_patience: 早停耐心值
+            use_class_weight: 是否使用类权重
         """
         if self.model is None:
             raise ValueError("模型尚未初始化，请先进行完整训练")
         
         logger.info("开始增量训练...")
+        logger.info(f"  数据量: {len(X_new)} 样本")
+        logger.info(f"  验证集比例: {validation_split:.0%}")
+        logger.info(f"  学习率: {learning_rate}")
         
-        # 重新编译模型以确保优化器正确初始化（解决 Keras 优化器变量问题）
-        # 使用较小的学习率进行增量训练
+        # ============ 计算类权重 ============
+        class_weight_dict = None
+        if use_class_weight:
+            from sklearn.utils.class_weight import compute_class_weight
+            classes = np.unique(y_new)
+            class_weights = compute_class_weight(
+                class_weight='balanced',
+                classes=classes,
+                y=y_new
+            )
+            class_weight_dict = dict(zip(classes, class_weights))
+            
+            class_counts = np.bincount(y_new.astype(int))
+            logger.info(f"  类别分布: {class_counts}")
+            logger.info(f"  类权重: {class_weight_dict}")
+        
+        # 重新编译模型（使用较小的学习率）
         self.model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=1e-5),
+            optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
             loss='sparse_categorical_crossentropy',
             metrics=['accuracy']
         )
         
-        self.model.fit(
+        # ============ 回调函数 ============
+        callback_list = []
+        
+        # 早停（比完整训练更敏感）
+        early_stop = keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=early_stopping_patience,
+            restore_best_weights=True,
+            verbose=1
+        )
+        callback_list.append(early_stop)
+        
+        # 学习率衰减（更敏感的参数）
+        lr_scheduler = keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=2,
+            min_lr=1e-7,
+            verbose=1
+        )
+        callback_list.append(lr_scheduler)
+        
+        # 训练（带验证集、早停和类权重）
+        history = self.model.fit(
             X_new, y_new,
+            validation_split=validation_split,
             epochs=epochs,
             batch_size=batch_size,
+            callbacks=callback_list,
+            class_weight=class_weight_dict,
             verbose=1
         )
         
-        logger.info("增量训练完成")
+        # 输出训练结果
+        final_loss = history.history['loss'][-1]
+        final_val_loss = history.history['val_loss'][-1]
+        final_acc = history.history['accuracy'][-1]
+        final_val_acc = history.history['val_accuracy'][-1]
+        
+        logger.info(f"增量训练完成:")
+        logger.info(f"  训练损失: {final_loss:.4f}, 验证损失: {final_val_loss:.4f}")
+        logger.info(f"  训练准确率: {final_acc:.4f}, 验证准确率: {final_val_acc:.4f}")
+        
+        return history.history
     
     def predict(self, X: np.ndarray) -> np.ndarray:
         """
