@@ -8,15 +8,13 @@ from typing import Dict, Tuple
 import pandas as pd
 import numpy as np
 
-from config import TrainingConfig
+from config import TrainingConfig, setup_logging
 from data_fetcher import BinanceDataFetcher
 from feature_engineering import FeatureEngineer
 from lstm_trainer import LSTMRegimeClassifier
+from hmm_trainer import HMMRegimeLabeler
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+setup_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class RealtimeRegimePredictor:
@@ -35,7 +33,7 @@ class RealtimeRegimePredictor:
         self.data_fetcher = BinanceDataFetcher()
         self.feature_engineer = FeatureEngineer(cache_manager=self.data_fetcher.cache_manager)
         
-        # 加载模型
+        # 加载 LSTM 模型
         model_path = config.get_model_path(symbol)
         scaler_path = config.get_scaler_path(symbol)
         
@@ -45,7 +43,46 @@ class RealtimeRegimePredictor:
             )
         
         self.lstm_classifier = LSTMRegimeClassifier.load(model_path, scaler_path)
-        logger.info(f"已加载 {symbol} 的模型")
+        logger.info(f"已加载 {symbol} 的 LSTM 模型")
+        
+        # 加载 HMM 模型以获取状态映射
+        hmm_path = config.get_hmm_path(symbol)
+        self.regime_mapping = {}  # 默认空映射
+        
+        if os.path.exists(hmm_path):
+            try:
+                hmm_labeler = HMMRegimeLabeler.load(hmm_path)
+                self.regime_mapping = hmm_labeler.get_regime_mapping()
+                logger.info(f"已加载 {symbol} 的状态映射: {self.regime_mapping}")
+            except Exception as e:
+                logger.warning(f"无法加载 HMM 模型的状态映射: {e}")
+                logger.warning("将使用默认的状态名称（State_0, State_1, ...）")
+        else:
+            logger.warning(f"HMM 模型不存在: {hmm_path}")
+            logger.warning("将使用默认的状态名称（State_0, State_1, ...）")
+    
+    def _get_regime_name(self, regime_id: int) -> str:
+        """
+        获取状态 ID 对应的语义名称
+        
+        优先使用 HMM 模型中保存的映射，如果没有则回退到 config 中的硬编码名称
+        
+        Args:
+            regime_id: 状态 ID
+            
+        Returns:
+            语义名称
+        """
+        # 优先使用 HMM 模型中的动态映射
+        if self.regime_mapping and regime_id in self.regime_mapping:
+            return self.regime_mapping[regime_id]
+        
+        # 回退到 config 中的硬编码名称（向后兼容）
+        if hasattr(self.config, 'REGIME_NAMES') and regime_id in self.config.REGIME_NAMES:
+            return self.config.REGIME_NAMES[regime_id]
+        
+        # 最后使用通用名称
+        return f"State_{regime_id}"
     
     def _get_timeframe_minutes(self, timeframe: str) -> int:
         """将时间框架转换为分钟数"""
@@ -129,22 +166,39 @@ class RealtimeRegimePredictor:
             # 4. 预测
             proba = self.lstm_classifier.predict_proba(X)[0]
             regime_id = np.argmax(proba)
-            regime_name = self.config.REGIME_NAMES.get(regime_id, f"State_{regime_id}")
+            confidence = float(proba[regime_id])
             
-            # 5. 返回结果
+            # 5. 置信度拒绝机制
+            confidence_threshold = getattr(self.config, 'CONFIDENCE_THRESHOLD', 0.4)
+            is_uncertain = confidence < confidence_threshold
+            
+            if is_uncertain:
+                regime_name = "Uncertain"
+                logger.warning(
+                    f"{self.symbol} 置信度过低 ({confidence:.2%} < {confidence_threshold:.0%})，"
+                    f"标记为 Uncertain（原判断: {self._get_regime_name(regime_id)}）"
+                )
+            else:
+                regime_name = self._get_regime_name(regime_id)
+            
+            # 6. 返回结果
             result = {
                 'symbol': self.symbol,
                 'timestamp': datetime.now(),
                 'regime_id': int(regime_id),
                 'regime_name': regime_name,
-                'confidence': float(proba[regime_id]),
+                'confidence': confidence,
+                'is_uncertain': is_uncertain,
+                'confidence_threshold': confidence_threshold,
+                'original_regime': self._get_regime_name(regime_id),  # 保留原始判断供参考
                 'probabilities': {
-                    self.config.REGIME_NAMES.get(i, f"State_{i}"): float(p)
+                    self._get_regime_name(i): float(p)
                     for i, p in enumerate(proba)
                 }
             }
             
-            logger.info(f"{self.symbol} 当前状态: {regime_name} (置信度: {proba[regime_id]:.2%})")
+            if not is_uncertain:
+                logger.info(f"{self.symbol} 当前状态: {regime_name} (置信度: {confidence:.2%})")
             return result
             
         except Exception as e:
@@ -220,25 +274,33 @@ class RealtimeRegimePredictor:
                 # 返回空 DataFrame，但包含正确的列
                 return pd.DataFrame(columns=['timestamp', 'regime_id', 'regime_name', 'confidence'])
             
-            # 滑动窗口预测
+            # 滑动窗口预测（带置信度拒绝）
             predictions = []
             features_scaled = self.lstm_classifier.scaler.transform(features)
+            confidence_threshold = getattr(self.config, 'CONFIDENCE_THRESHOLD', 0.4)
             
             for i in range(sequence_length, len(features_scaled)):
                 X = np.array([features_scaled[i-sequence_length:i]])
                 proba = self.lstm_classifier.predict_proba(X)[0]
                 regime_id = np.argmax(proba)
+                confidence = float(proba[regime_id])
+                
+                # 置信度拒绝
+                is_uncertain = confidence < confidence_threshold
+                regime_name = "Uncertain" if is_uncertain else self._get_regime_name(regime_id)
                 
                 predictions.append({
                     'timestamp': features.index[i],
                     'regime_id': regime_id,
-                    'regime_name': self.config.REGIME_NAMES.get(regime_id, f"State_{regime_id}"),
-                    'confidence': proba[regime_id]
+                    'regime_name': regime_name,
+                    'confidence': confidence,
+                    'is_uncertain': is_uncertain,
+                    'original_regime': self._get_regime_name(regime_id)
                 })
             
             if not predictions:
                 logger.warning("没有生成任何预测结果")
-                return pd.DataFrame(columns=['timestamp', 'regime_id', 'regime_name', 'confidence'])
+                return pd.DataFrame(columns=['timestamp', 'regime_id', 'regime_name', 'confidence', 'is_uncertain', 'original_regime'])
             
             return pd.DataFrame(predictions)
             

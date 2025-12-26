@@ -2,6 +2,8 @@
 配置文件 - 市场趋势分类器自动化训练系统
 """
 import os
+import sys
+import logging
 from datetime import datetime, timedelta
 
 class TrainingConfig:
@@ -21,30 +23,70 @@ class TrainingConfig:
     PRIMARY_TIMEFRAME = "15m"  # 主时间框架
     
     # 完整重训数据长度（天）
-    FULL_RETRAIN_DAYS = 730  # 24个月（2年）- 增加数据量以改善类别不平衡
+    FULL_RETRAIN_DAYS = 730  # 2年（2024-2025）- 增加数据量以改善类别不平衡
     
     # 增量训练数据长度（天）
     INCREMENTAL_TRAIN_DAYS = 30  # 最近30天
     
     # ============ HMM 配置 ============
     N_STATES = 6  # 市场状态数量
-    N_PCA_COMPONENTS = 4  # PCA 降维后的特征数
+    N_PCA_COMPONENTS = 5  # PCA 降维后的特征数
     
-    # 状态名称（保持与原项目一致）
+    # 状态名称（仅作为回退/参考）
+    # 注意：实际的状态映射由 HMM 模型在训练时自动生成并保存
+    # HMM 是无监督聚类模型，状态编号是任意的
+    # auto_map_regimes() 方法会根据特征统计（ADX、波动率等）自动确定每个状态的语义名称
+    # 这个配置仅在加载旧版本模型（没有保存映射）时作为回退使用
     REGIME_NAMES = {
-        0: "Choppy_High_Vol",
-        1: "Strong_Trend", 
-        2: "Volatility_Spike",
-        3: "Weak_Trend",
-        4: "Range",
-        5: "Squeeze"
+        0: "Choppy_High_Vol",   # 高波动无方向
+        1: "Strong_Trend",      # 强趋势
+        2: "Volatility_Spike",  # 波动率突增
+        3: "Weak_Trend",        # 弱趋势
+        4: "Range",             # 区间震荡
+        5: "Squeeze"            # 低波动蓄势
     }
+    
+    # ============ 置信度与稳健性配置 ============
+    # 置信度拒绝阈值：当最高概率低于此值时，输出 "Uncertain" 状态
+    CONFIDENCE_THRESHOLD = 0.4
+    
+    # 映射稳定性检查：新旧映射差异超过此阈值时触发警告
+    MAPPING_DIFF_THRESHOLD = 2  # 允许最多 2 个状态映射不同
+    
+    # BIC 验证：是否在训练时验证状态数量
+    VALIDATE_N_STATES = False  # 设为 True 启用 BIC 验证（会增加训练时间）
+    BIC_TEST_N_STATES = [4, 5, 6, 7, 8]  # 测试的状态数量范围
+    
+    # 转移矩阵监控：异常频繁切换的阈值（每小时切换次数）
+    REGIME_SWITCH_WARNING_THRESHOLD = 10
+    
+    # ============ 状态分布检查配置 ============
+    # 检测验证集/测试集是否缺失某些状态
+    # 如果某状态在验证集中完全缺失，LSTM 的 early stopping 将无法评估该状态
+    MIN_SAMPLES_PER_STATE = 10  # 每个状态在验证集中的最小样本数
+    MIN_RATIO_PER_STATE = 0.01  # 每个状态在验证集中的最小占比 (1%)
+    
+    # ============ Regime 自动映射绝对阈值护栏 ============
+    # 这些绝对阈值与相对阈值（基于中位数倍数）结合使用，
+    # 防止在极端市场条件下（如所有状态都低波动或都高波动）出现误标记
+    #
+    # 波动率阈值（基于 hl_pct，即 (high-low)/close 的百分比）
+    # - Volatility_Spike: 波动率必须 > 相对阈值 且 > MIN_VOL_FOR_SPIKE
+    # - Squeeze: 波动率必须 < 相对阈值 且 < MAX_VOL_FOR_SQUEEZE
+    REGIME_MIN_VOL_FOR_SPIKE = 0.02  # 波动率至少 2% 才能标记为 Volatility_Spike
+    REGIME_MAX_VOL_FOR_SQUEEZE = 0.01  # 波动率最多 1% 才能标记为 Squeeze
+    
+    # ADX 阈值
+    # - Strong_Trend: ADX 必须 > 相对阈值 且 > MIN_ADX_FOR_STRONG_TREND
+    # - Squeeze: ADX 必须 < 相对阈值 且 < MAX_ADX_FOR_SQUEEZE
+    REGIME_MIN_ADX_FOR_STRONG_TREND = 30  # ADX 至少 30 才能标记为 Strong_Trend
+    REGIME_MAX_ADX_FOR_SQUEEZE = 20  # ADX 最多 20 才能标记为 Squeeze
     
     # ============ LSTM 配置 ============
     SEQUENCE_LENGTH = 64  # LSTM 输入序列长度
     LSTM_UNITS = [128, 64]  # LSTM 层配置
     DENSE_UNITS = [64]  # 全连接层配置
-    DROPOUT_RATE = 0.3  # 增加dropout以缓解过拟合
+    DROPOUT_RATE = 0.35  # 增加dropout以缓解过拟合
     EPOCHS = 50
     BATCH_SIZE = 32
     
@@ -53,15 +95,16 @@ class TrainingConfig:
     # - 训练集：用于训练模型
     # - 验证集：用于早停和超参数调优
     # - 测试集：只用于最终评估，不参与任何模型选择
-    TRAIN_RATIO = 0.70  # 训练集比例
-    VAL_RATIO = 0.15    # 验证集比例
+    # 注意：增大验证集比例可以提高验证集覆盖所有状态的概率
+    TRAIN_RATIO = 0.65  # 训练集比例（从 0.70 降到 0.65）
+    VAL_RATIO = 0.20    # 验证集比例（从 0.15 增到 0.20）
     TEST_RATIO = 0.15   # 测试集比例
     
     # 旧配置（保持向后兼容，但不推荐使用）
     VALIDATION_SPLIT = 0.2
     
     # ============ 正则化配置 ============
-    L2_LAMBDA = 1e-3  # L2 正则化强度（权重衰减）; 已增大以缓解过拟合（从1e-4增加到1e-3）
+    L2_LAMBDA = 1.5e-3  # L2 正则化强度（权重衰减）; 已增大以缓解过拟合（从1e-4增加到1e-3）
     USE_BATCH_NORM = True  # 是否使用 BatchNormalization
     LEARNING_RATE = 1e-3  # Adam 优化器学习率
     USE_CLASS_WEIGHT = True  # 是否使用类权重（处理类别不平衡问题，让稀有状态的错误代价更高）
@@ -124,3 +167,64 @@ class TrainingConfig:
         for symbol in cls.SYMBOLS:
             os.makedirs(os.path.join(cls.MODELS_DIR, symbol), exist_ok=True)
             os.makedirs(os.path.join(cls.DATA_DIR, symbol), exist_ok=True)
+
+
+def setup_logging(log_file: str = None, level: int = logging.INFO):
+    """
+    配置logging，解决Windows控制台编码问题
+    跨平台兼容：Windows使用安全handler，Linux/macOS使用标准handler
+    
+    Args:
+        log_file: 日志文件路径（可选）
+        level: 日志级别
+    """
+    # 在Windows上需要特殊处理编码问题
+    # 在Linux/macOS上，终端通常支持UTF-8，可以直接使用标准handler
+    if sys.platform == 'win32':
+        # Windows: 创建UTF-8安全的StreamHandler
+        class SafeStreamHandler(logging.StreamHandler):
+            def emit(self, record):
+                try:
+                    msg = self.format(record)
+                    stream = self.stream
+                    # 尝试直接写入
+                    stream.write(msg + self.terminator)
+                    stream.flush()
+                except UnicodeEncodeError:
+                    # 如果编码失败，替换无法编码的字符
+                    try:
+                        msg = self.format(record)
+                        # 将无法编码的字符替换为?
+                        msg = msg.encode('ascii', errors='replace').decode('ascii')
+                        stream.write(msg + self.terminator)
+                        stream.flush()
+                    except Exception:
+                        # 如果还是失败，静默处理（避免无限循环）
+                        pass
+                except Exception:
+                    self.handleError(record)
+        
+        stream_handler = SafeStreamHandler()
+    else:
+        # Linux/macOS: 使用标准StreamHandler（通常支持UTF-8）
+        stream_handler = logging.StreamHandler()
+    
+    handlers = [stream_handler]
+    
+    # 添加文件handler（如果指定）
+    # 文件handler在所有平台上都使用UTF-8编码
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file, encoding='utf-8', errors='replace')
+            handlers.append(file_handler)
+        except Exception:
+            # 如果UTF-8失败，尝试默认编码
+            file_handler = logging.FileHandler(log_file, errors='replace')
+            handlers.append(file_handler)
+    
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=handlers,
+        force=True  # 强制重新配置，覆盖之前的配置
+    )

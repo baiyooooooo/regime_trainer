@@ -14,20 +14,13 @@ from typing import Dict, Tuple
 import pandas as pd
 import numpy as np
 
-from config import TrainingConfig
+from config import TrainingConfig, setup_logging
 from data_fetcher import BinanceDataFetcher
 from feature_engineering import FeatureEngineer
 from hmm_trainer import HMMRegimeLabeler
 from lstm_trainer import LSTMRegimeClassifier
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('training.log'),
-        logging.StreamHandler()
-    ]
-)
+setup_logging(log_file='training.log', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class TrainingPipeline:
@@ -139,10 +132,34 @@ class TrainingPipeline:
         
         # 4. HMM 标注（只在训练集上拟合，避免数据泄漏）
         logger.info("步骤 4/6: HMM 状态标注（只在训练集上拟合）...")
+        
+        # 加载旧模型的映射（用于比对）
+        hmm_path = self.config.get_hmm_path(symbol)
+        old_mapping = None
+        if os.path.exists(hmm_path):
+            try:
+                old_hmm = HMMRegimeLabeler.load(hmm_path)
+                old_mapping = old_hmm.get_regime_mapping()
+                logger.info(f"已加载旧模型映射用于比对: {old_mapping}")
+            except Exception as e:
+                logger.warning(f"无法加载旧模型: {e}")
+        
         hmm_labeler = HMMRegimeLabeler(
             n_states=self.config.N_STATES,
-            n_components=self.config.N_PCA_COMPONENTS
+            n_components=self.config.N_PCA_COMPONENTS,
+            primary_timeframe=self.config.PRIMARY_TIMEFRAME
         )
+        
+        # 可选：BIC 验证状态数量是否合理
+        bic_validation = None
+        if getattr(self.config, 'VALIDATE_N_STATES', False):
+            logger.info("执行 BIC 验证（验证状态数量是否合理）...")
+            bic_test_states = getattr(self.config, 'BIC_TEST_N_STATES', [4, 5, 6, 7, 8])
+            bic_validation = hmm_labeler.validate_n_states(
+                train_features, 
+                n_states_range=bic_test_states
+            )
+            logger.info(f"BIC 验证结果: {bic_validation['recommendation']}")
         
         # 使用新方法：在训练集上拟合，分别预测各数据集的标签
         train_states, val_states, test_states = hmm_labeler.fit_predict_split(
@@ -151,12 +168,49 @@ class TrainingPipeline:
             test_features=test_features
         )
         
-        # 保存 HMM 模型
-        hmm_path = self.config.get_hmm_path(symbol)
+        # 自动映射 HMM 状态到语义名称（关键步骤！）
+        # 使用配置中的绝对阈值护栏参数
+        regime_mapping = hmm_labeler.auto_map_regimes(
+            train_features, 
+            train_states,
+            min_vol_for_spike=getattr(self.config, 'REGIME_MIN_VOL_FOR_SPIKE', 0.02),
+            max_vol_for_squeeze=getattr(self.config, 'REGIME_MAX_VOL_FOR_SQUEEZE', 0.01),
+            min_adx_for_strong_trend=getattr(self.config, 'REGIME_MIN_ADX_FOR_STRONG_TREND', 30),
+            max_adx_for_squeeze=getattr(self.config, 'REGIME_MAX_ADX_FOR_SQUEEZE', 20)
+        )
+        logger.info(f"HMM 状态到语义名称的映射: {regime_mapping}")
+        
+        # 检查状态分布是否健康（验证集/测试集是否缺失某些状态）
+        state_distribution_check = hmm_labeler.check_state_distribution(
+            train_states=train_states,
+            val_states=val_states,
+            test_states=test_states,
+            min_samples_per_state=getattr(self.config, 'MIN_SAMPLES_PER_STATE', 10),
+            min_ratio_per_state=getattr(self.config, 'MIN_RATIO_PER_STATE', 0.01)
+        )
+        
+        # 新旧映射比对（检测语义漂移）
+        mapping_comparison = None
+        if old_mapping is not None:
+            mapping_diff_threshold = getattr(self.config, 'MAPPING_DIFF_THRESHOLD', 2)
+            mapping_comparison = hmm_labeler.compare_mapping(old_mapping, threshold=mapping_diff_threshold)
+            logger.info(f"映射比对结果: {mapping_comparison['message']}")
+        
+        # 分析 regime 稳定性（检测异常频繁切换）
+        switch_threshold = getattr(self.config, 'REGIME_SWITCH_WARNING_THRESHOLD', 10)
+        stability_analysis = hmm_labeler.analyze_regime_stability(train_states, switch_threshold)
+        
+        # 计算驻留时间分布
+        dwell_times = hmm_labeler.compute_dwell_times(train_states)
+        logger.info(f"状态驻留时间分布: {dwell_times}")
+        
+        # 保存 HMM 模型（包含状态映射、profiles、转移矩阵等）
         hmm_labeler.save(hmm_path)
         
         # 分析市场状态（只用训练集分析，避免泄漏）
         regime_analysis = hmm_labeler.analyze_regimes(train_features, train_states)
+        # 添加语义名称到分析结果
+        regime_analysis['regime_name'] = regime_analysis['state'].map(regime_mapping)
         logger.info(f"\n训练集市场状态分析:\n{regime_analysis}")
         
         # 5. 准备 LSTM 训练数据
@@ -227,6 +281,13 @@ class TrainingPipeline:
             'val_accuracy': val_eval['accuracy'],
             'test_loss': eval_results['loss'],
             'regime_analysis': regime_analysis,
+            'regime_mapping': regime_mapping,  # HMM 状态到语义名称的映射
+            'mapping_comparison': mapping_comparison,  # 新旧映射比对结果
+            'stability_analysis': stability_analysis,  # regime 稳定性分析
+            'state_distribution_check': state_distribution_check,  # 状态分布健康检查
+            'dwell_times': dwell_times,  # 状态驻留时间分布
+            'training_bic': hmm_labeler.training_bic_,  # HMM 训练的 BIC 值
+            'bic_validation': bic_validation,  # BIC 状态数量验证结果
             'history': history,
             'data_split': {
                 'train_samples': len(train_features),

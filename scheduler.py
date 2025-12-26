@@ -5,17 +5,10 @@ import schedule
 import time
 import logging
 from datetime import datetime
-from config import TrainingConfig
+from config import TrainingConfig, setup_logging
 from training_pipeline import TrainingPipeline
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('scheduler.log'),
-        logging.StreamHandler()
-    ]
-)
+setup_logging(log_file='scheduler.log', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class TrainingScheduler:

@@ -3,14 +3,11 @@
 """
 import sys
 import logging
-from config import TrainingConfig
+from config import TrainingConfig, setup_logging
 from training_pipeline import TrainingPipeline
 from realtime_predictor import RealtimeRegimePredictor, MultiSymbolRegimeTracker
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+setup_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def example_1_single_symbol_training():
@@ -39,6 +36,20 @@ def example_1_single_symbol_training():
         print(f"测试集损失: {result['test_loss']:.4f}")
         if 'val_accuracy' in result:
             print(f"验证集准确率: {result['val_accuracy']:.2%}")
+        
+        # 显示状态分布检查结果
+        if 'state_distribution_check' in result:
+            dist_check = result['state_distribution_check']
+            if not dist_check['healthy']:
+                print(f"\n⚠️  状态分布警告:")
+                for warning in dist_check['warnings']:
+                    print(f"   {warning}")
+                if dist_check['recommendations']:
+                    print(f"\n💡 建议:")
+                    for rec in dist_check['recommendations']:
+                        print(f"   {rec}")
+            else:
+                print(f"\n✓ 状态分布健康：所有状态在各数据集中都有足够样本")
     except KeyboardInterrupt:
         print("\n\n⚠️  训练被用户中断")
         raise
@@ -76,6 +87,11 @@ def example_2_multiple_symbols_training():
             print(f"{symbol}: 失败 - {result['error']}")
         else:
             print(f"{symbol}: 测试集准确率 {result['test_accuracy']:.2%}")
+            # 显示状态分布警告
+            if 'state_distribution_check' in result:
+                dist_check = result['state_distribution_check']
+                if not dist_check['healthy']:
+                    print(f"  ⚠️ 警告: 验证集缺失 {len(dist_check['missing_states']['val'])} 个状态")
 
 
 def example_3_realtime_prediction():
