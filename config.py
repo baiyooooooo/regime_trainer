@@ -11,10 +11,10 @@ class TrainingConfig:
     
     # ============ 交易对配置 ============
     SYMBOLS = [
-        # "BTCUSDT",
-        # "ETHUSDT",
-        "SOLUSDT",
-        "BNBUSDT",
+        "BTCUSDT",
+        "ETHUSDT",
+        # "SOLUSDT",
+        # "BNBUSDT",
         # 添加更多交易对
     ]
     
@@ -106,10 +106,10 @@ class TrainingConfig:
     REGIME_MAX_ADX_FOR_SQUEEZE = 20  # ADX 最多 20 才能标记为 Squeeze
     
     # ============ LSTM 配置 ============
-    SEQUENCE_LENGTH = 64  # LSTM 输入序列长度
-    LSTM_UNITS = [128, 64]  # LSTM 层配置
-    DENSE_UNITS = [64]  # 全连接层配置
-    DROPOUT_RATE = 0.35  # 增加dropout以缓解过拟合
+    SEQUENCE_LENGTH = 32  # LSTM 输入序列长度（32根15m K线 = 8小时，适合日内交易）
+    LSTM_UNITS = [64, 32]  # LSTM 层配置（调整为匹配32根K线的序列长度）
+    DENSE_UNITS = [32]  # 全连接层配置（调整为匹配更小的模型容量）
+    DROPOUT_RATE = 0.25  # Dropout比率（降低正则化，给模型更多学习空间）
     EPOCHS = 50
     BATCH_SIZE = 32
     
@@ -127,7 +127,7 @@ class TrainingConfig:
     VALIDATION_SPLIT = 0.2
     
     # ============ 正则化配置 ============
-    L2_LAMBDA = 1.5e-3  # L2 正则化强度（权重衰减）; 已增大以缓解过拟合（从1e-4增加到1e-3）
+    L2_LAMBDA = 1e-3  # L2 正则化强度（权重衰减，降低以匹配更小的模型容量）
     USE_BATCH_NORM = True  # 是否使用 BatchNormalization
     LEARNING_RATE = 1e-3  # Adam 优化器学习率
     USE_CLASS_WEIGHT = True  # 是否使用类权重（处理类别不平衡问题，让稀有状态的错误代价更高）
