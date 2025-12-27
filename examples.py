@@ -1,14 +1,19 @@
 """
 快速开始示例脚本
+支持 5m 和 15m 两种时间框架的训练和预测
 """
 import sys
 import logging
 from config import TrainingConfig, setup_logging
 from training_pipeline import TrainingPipeline
 from realtime_predictor import RealtimeRegimePredictor, MultiSymbolRegimeTracker
+from model_api import ModelAPI
 
 setup_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 默认时间框架
+DEFAULT_TIMEFRAME = "15m"
 
 def example_1_single_symbol_training():
     """示例 1: 训练单个交易对"""
@@ -261,23 +266,307 @@ def example_6_incremental_training():
         raise
 
 
+# ============================================================================
+# 5m 时间框架专用示例
+# ============================================================================
+
+def example_7_5m_single_symbol_training():
+    """示例 7: 训练单个交易对的 5m 模型"""
+    print("\n" + "="*80)
+    print("示例 7: 训练单个交易对的 5m 模型 (BTCUSDT)")
+    print("="*80 + "\n")
+    
+    print("⚠️  注意：完整训练可能需要较长时间（10-30分钟）")
+    print("   包括：数据获取、特征工程、HMM训练、LSTM训练")
+    print("   5m 模型使用更短的时间框架进行更快速的决策")
+    print("   请耐心等待...\n")
+    
+    sys.stdout.flush()
+    
+    try:
+        pipeline = TrainingPipeline(TrainingConfig)
+        
+        # 完整重训 5m 模型
+        logger.info("开始训练 5m 模型...")
+        result = pipeline.full_retrain("BTCUSDT", primary_timeframe="5m")
+        
+        print(f"\n✅ 5m 模型训练完成！")
+        print(f"测试集准确率: {result['test_accuracy']:.2%}")
+        print(f"测试集损失: {result['test_loss']:.4f}")
+        if 'val_accuracy' in result:
+            print(f"验证集准确率: {result['val_accuracy']:.2%}")
+        
+        # 显示动态状态数量优化结果
+        if result.get('n_states_optimization'):
+            opt = result['n_states_optimization']
+            if opt['adjusted']:
+                print(f"\n🔄 状态数量已自动调整: {opt['original_n_states']} -> {opt['optimal_n_states']}")
+                current_names = set(result.get('regime_mapping', {}).values())
+                print(f"   保留的状态: {sorted(current_names)}")
+            else:
+                print(f"\n✓ 状态数量保持不变: {opt['optimal_n_states']}")
+        
+        print(f"最终状态数量: {result.get('final_n_states', 6)}")
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠️  训练被用户中断")
+        raise
+    except Exception as e:
+        print(f"\n❌ 5m 模型训练失败: {e}")
+        raise
+
+
+def example_8_5m_realtime_prediction():
+    """示例 8: 5m 实时市场状态预测"""
+    print("\n" + "="*80)
+    print("示例 8: 5m 实时市场状态预测")
+    print("="*80 + "\n")
+    
+    try:
+        # 创建 5m 预测器
+        predictor = RealtimeRegimePredictor("BTCUSDT", TrainingConfig, primary_timeframe="5m")
+        
+        # 获取当前市场状态
+        current = predictor.get_current_regime()
+        
+        print(f"\n{current['symbol']} 当前市场状态 (5m 时间框架):")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"状态: {current['regime_name']}")
+        print(f"置信度: {current['confidence']:.2%}")
+        print(f"时间: {current['timestamp']}")
+        
+        print(f"\n所有状态概率分布:")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        for regime, prob in sorted(
+            current['probabilities'].items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        ):
+            bar = "█" * int(prob * 50)
+            print(f"{regime:20s} {prob:6.2%} {bar}")
+        
+    except FileNotFoundError:
+        print("\n❌ 5m 模型文件不存在，请先运行 5m 训练（示例 7）")
+
+
+def example_9_5m_incremental_training():
+    """示例 9: 5m 增量训练"""
+    print("\n" + "="*80)
+    print("示例 9: 5m 增量训练（在现有 5m 模型基础上）")
+    print("="*80 + "\n")
+    
+    print("⚠️  注意：增量训练通常需要 2-5 分钟")
+    print("   包括：获取最新数据、特征工程、模型更新")
+    print("   请耐心等待...\n")
+    
+    sys.stdout.flush()
+    
+    try:
+        pipeline = TrainingPipeline(TrainingConfig)
+        
+        # 执行 5m 增量训练
+        logger.info("开始 5m 增量训练...")
+        result = pipeline.incremental_train("BTCUSDT", primary_timeframe="5m")
+        
+        print(f"\n✅ 5m 增量训练完成！")
+        print(f"使用样本数: {result['samples_used']}")
+        print(f"训练时间: {result['timestamp']}")
+        
+    except FileNotFoundError as e:
+        print(f"\n❌ 5m 模型文件不存在: {e}")
+        print("   请先运行 5m 完整训练（示例 7）")
+    except KeyboardInterrupt:
+        print("\n\n⚠️  训练被用户中断")
+        raise
+    except Exception as e:
+        print(f"\n❌ 5m 增量训练失败: {e}")
+        raise
+
+
+def example_10_5m_regime_history():
+    """示例 10: 查看 5m 历史市场状态变化"""
+    print("\n" + "="*80)
+    print("示例 10: 5m 历史市场状态变化")
+    print("="*80 + "\n")
+    
+    try:
+        predictor = RealtimeRegimePredictor("BTCUSDT", TrainingConfig, primary_timeframe="5m")
+        
+        # 获取最近 4 小时的状态变化（5m 模型适合更短周期）
+        history = predictor.get_regime_history(lookback_hours=4)
+        
+        print(f"\n最近 4 小时的 5m 市场状态变化:")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        
+        if history.empty:
+            print("⚠️  没有足够的历史数据进行分析。")
+        else:
+            print(history.tail(20))
+            
+            # 统计各状态出现次数
+            print(f"\n状态分布:")
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            regime_counts = history['regime_name'].value_counts()
+            for regime, count in regime_counts.items():
+                percentage = count / len(history) * 100
+                print(f"{regime:20s} {count:4d} 次 ({percentage:5.1f}%)")
+        
+    except FileNotFoundError:
+        print("\n❌ 5m 模型文件不存在，请先运行 5m 训练（示例 7）")
+
+
+def example_11_multi_timeframe_prediction():
+    """示例 11: 多时间框架并行预测 (5m + 15m)"""
+    print("\n" + "="*80)
+    print("示例 11: 多时间框架并行预测 (5m + 15m)")
+    print("="*80 + "\n")
+    
+    try:
+        api = ModelAPI()
+        
+        # 同时获取 5m 和 15m 的预测
+        results = api.predict_multi_timeframe_regimes("BTCUSDT", ["5m", "15m"])
+        
+        print(f"\nBTCUSDT 多时间框架市场状态:")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        
+        for tf, result in results.items():
+            if 'error' in result:
+                print(f"\n{tf} 时间框架: ❌ {result['error']}")
+            else:
+                print(f"\n{tf} 时间框架:")
+                print(f"  状态: {result['regime_name']}")
+                print(f"  置信度: {result['confidence']:.2%}")
+                print(f"  概率分布:")
+                for regime, prob in sorted(
+                    result['probabilities'].items(), 
+                    key=lambda x: x[1], 
+                    reverse=True
+                )[:3]:  # 只显示前3个
+                    bar = "█" * int(prob * 30)
+                    print(f"    {regime:20s} {prob:6.2%} {bar}")
+        
+        # 比较两个时间框架的状态
+        if '5m' in results and '15m' in results:
+            if 'error' not in results['5m'] and 'error' not in results['15m']:
+                r5m = results['5m']['regime_name']
+                r15m = results['15m']['regime_name']
+                
+                print(f"\n📊 时间框架对比:")
+                print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                if r5m == r15m:
+                    print(f"✓ 5m 和 15m 状态一致: {r5m}")
+                else:
+                    print(f"⚠️ 5m ({r5m}) 和 15m ({r15m}) 状态不一致")
+                    print(f"   这可能表示市场正在发生短期变化")
+        
+    except Exception as e:
+        print(f"\n❌ 错误: {e}")
+        print("请确保至少有一个时间框架的模型已完成训练")
+
+
+def example_12_5m_multi_symbol_tracking():
+    """示例 12: 5m 多交易对市场状态跟踪"""
+    print("\n" + "="*80)
+    print("示例 12: 5m 多交易对市场状态跟踪")
+    print("="*80 + "\n")
+    
+    try:
+        # 创建 5m 多交易对跟踪器
+        tracker = MultiSymbolRegimeTracker(
+            symbols=["BTCUSDT", "ETHUSDT"],
+            config=TrainingConfig,
+            primary_timeframe="5m"
+        )
+        
+        # 获取所有交易对的当前状态
+        all_regimes = tracker.get_all_regimes()
+        
+        print(f"\n所有交易对当前 5m 状态:")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        for symbol, result in all_regimes.items():
+            if 'error' not in result:
+                print(f"{symbol:12s} {result['regime_name']:20s} 置信度: {result['confidence']:.2%}")
+            else:
+                print(f"{symbol:12s} ❌ {result['error']}")
+        
+        # 获取状态摘要
+        summary = tracker.get_regime_summary()
+        if not summary.empty:
+            print(f"\n5m 市场状态摘要表:")
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            print(summary.to_string(index=False))
+        
+    except Exception as e:
+        print(f"\n❌ 错误: {e}")
+        print("请确保至少有一个交易对的 5m 模型已完成训练")
+
+
+def example_13_batch_5m_training():
+    """示例 13: 批量训练多个交易对的 5m 模型"""
+    print("\n" + "="*80)
+    print("示例 13: 批量训练多个交易对的 5m 模型")
+    print("="*80 + "\n")
+    
+    symbols = TrainingConfig.SYMBOLS
+    
+    pipeline = TrainingPipeline(TrainingConfig)
+    
+    logger.info(f"开始批量训练 {len(symbols)} 个交易对的 5m 模型...")
+    
+    results = pipeline.train_all_symbols(training_type='full', primary_timeframe="5m")
+    
+    print("\n5m 模型训练结果汇总:")
+    for symbol, result in results.items():
+        if 'error' in result:
+            print(f"{symbol}: 失败 - {result['error']}")
+        else:
+            print(f"{symbol}: 测试集准确率 {result['test_accuracy']:.2%}")
+            if result.get('n_states_optimization') and result['n_states_optimization']['adjusted']:
+                opt = result['n_states_optimization']
+                print(f"  🔄 状态数量调整: {opt['original_n_states']} -> {opt['optimal_n_states']}")
+
+
 def print_menu():
     """打印菜单"""
     print("\n" + "="*80)
     print("加密货币市场状态分类器 - 示例脚本")
     print("="*80)
     print("\n选择要运行的示例：")
-    print("\n训练相关:")
-    print("  1. 训练单个交易对 (BTCUSDT)")
-    print("  2. 批量训练多个交易对")
-    print("  6. 增量训练（需要先运行示例 1）")
-    print("\n推理相关:")
-    print("  3. 实时市场状态预测")
-    print("  4. 查看历史市场状态变化")
-    print("  5. 多交易对市场状态跟踪")
-    print("\n其他:")
-    print("  0. 退出")
-    print("\n" + "="*80)
+    
+    print("\n" + "-"*40)
+    print("📊 15m 时间框架 (默认)")
+    print("-"*40)
+    print("  训练相关:")
+    print("    1. 训练单个交易对 (BTCUSDT)")
+    print("    2. 批量训练多个交易对")
+    print("    6. 增量训练")
+    print("  推理相关:")
+    print("    3. 实时市场状态预测")
+    print("    4. 查看历史市场状态变化")
+    print("    5. 多交易对市场状态跟踪")
+    
+    print("\n" + "-"*40)
+    print("⚡ 5m 时间框架 (快速决策)")
+    print("-"*40)
+    print("  训练相关:")
+    print("    7. 训练单个交易对 5m 模型 (BTCUSDT)")
+    print("   13. 批量训练多个交易对 5m 模型")
+    print("    9. 5m 增量训练")
+    print("  推理相关:")
+    print("    8. 5m 实时市场状态预测")
+    print("   10. 5m 历史市场状态变化")
+    print("   12. 5m 多交易对市场状态跟踪")
+    
+    print("\n" + "-"*40)
+    print("🔄 多时间框架")
+    print("-"*40)
+    print("   11. 多时间框架并行预测 (5m + 15m)")
+    
+    print("\n" + "-"*40)
+    print("其他:")
+    print("    0. 退出")
+    print("="*80)
 
 
 def main():
@@ -287,12 +576,21 @@ def main():
     
     # 运行选定的示例
     examples = {
+        # 15m 时间框架
         1: example_1_single_symbol_training,
         2: example_2_multiple_symbols_training,
         3: example_3_realtime_prediction,
         4: example_4_regime_history,
         5: example_5_multi_symbol_tracking,
         6: example_6_incremental_training,
+        # 5m 时间框架
+        7: example_7_5m_single_symbol_training,
+        8: example_8_5m_realtime_prediction,
+        9: example_9_5m_incremental_training,
+        10: example_10_5m_regime_history,
+        11: example_11_multi_timeframe_prediction,
+        12: example_12_5m_multi_symbol_tracking,
+        13: example_13_batch_5m_training,
     }
     
     # 如果有命令行参数，直接运行指定示例

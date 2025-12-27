@@ -16,7 +16,7 @@ import pandas as pd
 import numpy as np
 
 from config import TrainingConfig, setup_logging
-from realtime_predictor import RealtimeRegimePredictor
+from realtime_predictor import RealtimeRegimePredictor, MultiTimeframeRegimePredictor
 
 setup_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,31 +47,64 @@ class ModelAPI:
             config: 训练配置，如果为None则使用默认配置
         """
         self.config = config or TrainingConfig
-        self._predictors = {}  # 缓存预测器，避免重复加载模型
+        self._predictors = {}  # 缓存预测器，避免重复加载模型 {(symbol, timeframe): predictor}
+        self._multi_tf_predictors = {}  # 缓存多时间框架预测器 {symbol: predictor}
     
-    def _get_predictor(self, symbol: str) -> RealtimeRegimePredictor:
+    def _get_predictor(self, symbol: str, primary_timeframe: str = None) -> RealtimeRegimePredictor:
         """
         获取或创建预测器（带缓存）
         
         Args:
             symbol: 交易对
+            primary_timeframe: 主时间框架（如 "5m" 或 "15m"），如果为 None 则使用默认配置
             
         Returns:
             预测器实例
         """
-        if symbol not in self._predictors:
-            try:
-                self._predictors[symbol] = RealtimeRegimePredictor(symbol, self.config)
-            except FileNotFoundError as e:
-                logger.error(f"无法加载 {symbol} 的模型: {e}")
-                raise ValueError(f"模型文件不存在，请先训练 {symbol} 的模型")
+        if primary_timeframe is None:
+            primary_timeframe = self.config.PRIMARY_TIMEFRAME
         
-        return self._predictors[symbol]
+        cache_key = (symbol, primary_timeframe)
+        
+        if cache_key not in self._predictors:
+            try:
+                self._predictors[cache_key] = RealtimeRegimePredictor(
+                    symbol, self.config, primary_timeframe
+                )
+            except FileNotFoundError as e:
+                logger.error(f"无法加载 {symbol} ({primary_timeframe}) 的模型: {e}")
+                raise ValueError(f"模型文件不存在，请先训练 {symbol} 的 {primary_timeframe} 模型")
+        
+        return self._predictors[cache_key]
+    
+    def _get_multi_tf_predictor(self, symbol: str, timeframes: list = None) -> MultiTimeframeRegimePredictor:
+        """
+        获取或创建多时间框架预测器（带缓存）
+        
+        Args:
+            symbol: 交易对
+            timeframes: 时间框架列表
+            
+        Returns:
+            多时间框架预测器实例
+        """
+        if timeframes is None:
+            timeframes = self.config.ENABLED_MODELS
+        
+        cache_key = symbol
+        
+        if cache_key not in self._multi_tf_predictors:
+            self._multi_tf_predictors[cache_key] = MultiTimeframeRegimePredictor(
+                symbol, self.config, timeframes
+            )
+        
+        return self._multi_tf_predictors[cache_key]
     
     def predict_next_regime(
         self,
         symbol: str,
-        timeframe: str = "15m"
+        timeframe: str = None,
+        primary_timeframe: str = None
     ) -> Dict:
         """
         预测下一根K线的market regime概率分布
@@ -83,7 +116,8 @@ class ModelAPI:
         
         Args:
             symbol: 交易对（如 "BTCUSDT"）
-            timeframe: 时间框架（如 "15m", "1h"），必须与训练时的主时间框架一致
+            timeframe: [已废弃] 使用 primary_timeframe 代替
+            primary_timeframe: 主时间框架（如 "5m", "15m"），如果为 None 则使用默认配置
             
         Returns:
             包含预测结果的字典:
@@ -111,17 +145,16 @@ class ModelAPI:
                 }
             }
         """
-        # 验证时间框架
-        if timeframe != self.config.PRIMARY_TIMEFRAME:
-            logger.warning(
-                f"请求的时间框架 {timeframe} 与训练时的主时间框架 "
-                f"{self.config.PRIMARY_TIMEFRAME} 不一致。"
-                f"将使用训练时的主时间框架 {self.config.PRIMARY_TIMEFRAME}"
-            )
-            timeframe = self.config.PRIMARY_TIMEFRAME
+        # 处理 timeframe 参数（向后兼容）
+        if primary_timeframe is None:
+            if timeframe is not None and timeframe in self.config.MODEL_CONFIGS:
+                primary_timeframe = timeframe
+            else:
+                primary_timeframe = self.config.PRIMARY_TIMEFRAME
         
         # 获取预测器
-        predictor = self._get_predictor(symbol)
+        predictor = self._get_predictor(symbol, primary_timeframe)
+        timeframe = primary_timeframe  # 用于返回结果
         
         # 获取当前市场状态预测（实际上是预测下一根K线）
         current_regime = predictor.get_current_regime()
@@ -190,12 +223,13 @@ class ModelAPI:
         
         return self.predict_next_regime(symbol, timeframe)
     
-    def get_model_metadata(self, symbol: str) -> Dict:
+    def get_model_metadata(self, symbol: str, primary_timeframe: str = None) -> Dict:
         """
         获取模型元数据
         
         Args:
             symbol: 交易对
+            primary_timeframe: 主时间框架（如 "5m" 或 "15m"），如果为 None 则使用默认配置
             
         Returns:
             模型元数据字典:
@@ -216,14 +250,17 @@ class ModelAPI:
                 }
             }
         """
-        predictor = self._get_predictor(symbol)
+        if primary_timeframe is None:
+            primary_timeframe = self.config.PRIMARY_TIMEFRAME
+        
+        predictor = self._get_predictor(symbol, primary_timeframe)
         model_info = self._get_model_info(predictor)
         
         # 获取模型路径
         model_paths = {
-            'lstm': self.config.get_model_path(symbol, 'lstm'),
-            'hmm': self.config.get_hmm_path(symbol),
-            'scaler': self.config.get_scaler_path(symbol)
+            'lstm': self.config.get_model_path(symbol, 'lstm', primary_timeframe),
+            'hmm': self.config.get_hmm_path(symbol, primary_timeframe),
+            'scaler': self.config.get_scaler_path(symbol, primary_timeframe)
         }
         
         # 获取训练信息
@@ -263,40 +300,112 @@ class ModelAPI:
             regime_mapping = {i: f"State_{i}" for i in range(n_states)}
         
         return {
-            'primary_timeframe': self.config.PRIMARY_TIMEFRAME,
+            'primary_timeframe': predictor.primary_timeframe,
             'n_states': predictor.lstm_classifier.n_states,
             'regime_mapping': regime_mapping
         }
     
-    def list_available_models(self) -> List[str]:
+    def predict_multi_timeframe(
+        self,
+        symbol: str,
+        timeframes: List[str] = None
+    ) -> Dict:
+        """
+        同时预测多个时间框架的 market regime
+        
+        Args:
+            symbol: 交易对
+            timeframes: 时间框架列表（如 ["5m", "15m"]），如果为 None 则使用 ENABLED_MODELS
+            
+        Returns:
+            包含多个时间框架预测结果的字典:
+            {
+                'symbol': str,
+                'timestamp': datetime,
+                'regimes': {
+                    '5m': {...预测结果...},
+                    '15m': {...预测结果...}
+                }
+            }
+        """
+        if timeframes is None:
+            timeframes = self.config.ENABLED_MODELS
+        
+        results = {
+            'symbol': symbol,
+            'timestamp': datetime.now(),
+            'regimes': {}
+        }
+        
+        for tf in timeframes:
+            try:
+                result = self.predict_next_regime(symbol, primary_timeframe=tf)
+                results['regimes'][tf] = result
+            except Exception as e:
+                logger.error(f"预测 {symbol} 的 {tf} regime 失败: {e}")
+                results['regimes'][tf] = {'error': str(e)}
+        
+        return results
+    
+    def list_available_models(self, primary_timeframe: str = None) -> List[str]:
         """
         列出所有可用的模型（已训练的交易对）
         
+        Args:
+            primary_timeframe: 主时间框架，如果为 None 则检查所有启用的时间框架
+            
         Returns:
             交易对列表
         """
         available = []
         
+        if primary_timeframe:
+            timeframes_to_check = [primary_timeframe]
+        else:
+            timeframes_to_check = self.config.ENABLED_MODELS
+        
         for symbol in self.config.SYMBOLS:
-            model_path = self.config.get_model_path(symbol, 'lstm')
-            scaler_path = self.config.get_scaler_path(symbol)
-            
-            if os.path.exists(model_path) and os.path.exists(scaler_path):
-                available.append(symbol)
+            for tf in timeframes_to_check:
+                model_path = self.config.get_model_path(symbol, 'lstm', tf)
+                scaler_path = self.config.get_scaler_path(symbol, tf)
+                
+                if os.path.exists(model_path) and os.path.exists(scaler_path):
+                    available.append(symbol)
+                    break  # 只要有一个时间框架的模型存在就认为可用
         
         return available
+    
+    def list_available_models_by_timeframe(self) -> Dict[str, List[str]]:
+        """
+        列出每个时间框架可用的模型
+        
+        Returns:
+            {timeframe: [symbol, ...]} 格式的字典
+        """
+        result = {}
+        
+        for tf in self.config.MODEL_CONFIGS.keys():
+            result[tf] = []
+            for symbol in self.config.SYMBOLS:
+                model_path = self.config.get_model_path(symbol, 'lstm', tf)
+                scaler_path = self.config.get_scaler_path(symbol, tf)
+                
+                if os.path.exists(model_path) and os.path.exists(scaler_path):
+                    result[tf].append(symbol)
+        
+        return result
     
     def batch_predict(
         self,
         symbols: List[str],
-        timeframe: str = "15m"
+        primary_timeframe: str = None
     ) -> Dict[str, Dict]:
         """
         批量预测多个交易对的下一根K线
         
         Args:
             symbols: 交易对列表
-            timeframe: 时间框架
+            primary_timeframe: 主时间框架
             
         Returns:
             {symbol: prediction_result} 字典
@@ -307,7 +416,7 @@ class ModelAPI:
             try:
                 results[symbol] = self.predict_next_regime(
                     symbol=symbol,
-                    timeframe=timeframe
+                    primary_timeframe=primary_timeframe
                 )
             except Exception as e:
                 logger.error(f"预测 {symbol} 失败: {e}")
@@ -319,7 +428,7 @@ class ModelAPI:
         self,
         symbol: str,
         regime_name: str,
-        timeframe: str = "15m"
+        primary_timeframe: str = None
     ) -> float:
         """
         获取下一根K线特定状态的概率（便捷方法）
@@ -327,14 +436,14 @@ class ModelAPI:
         Args:
             symbol: 交易对
             regime_name: 状态名称（如 "Strong_Trend"）
-            timeframe: 时间框架
+            primary_timeframe: 主时间框架
             
         Returns:
             该状态的概率（0.0-1.0）
         """
         result = self.predict_next_regime(
             symbol=symbol,
-            timeframe=timeframe
+            primary_timeframe=primary_timeframe
         )
         
         regime_probs = result['regime_probabilities']
@@ -357,7 +466,7 @@ class ModelAPI:
 
 def predict_regime(
     symbol: str,
-    timeframe: str = "15m",
+    primary_timeframe: str = None,
     config: TrainingConfig = None
 ) -> Dict:
     """
@@ -365,7 +474,7 @@ def predict_regime(
     
     Args:
         symbol: 交易对
-        timeframe: 时间框架
+        primary_timeframe: 主时间框架（如 "5m", "15m"）
         config: 配置（可选）
         
     Returns:
@@ -377,13 +486,38 @@ def predict_regime(
         print(result['regime_probabilities'])
     """
     api = ModelAPI(config)
-    return api.predict_next_regime(symbol, timeframe)
+    return api.predict_next_regime(symbol, primary_timeframe=primary_timeframe)
+
+
+def predict_multi_timeframe(
+    symbol: str,
+    timeframes: List[str] = None,
+    config: TrainingConfig = None
+) -> Dict:
+    """
+    便捷函数：同时预测多个时间框架的market regime
+    
+    Args:
+        symbol: 交易对
+        timeframes: 时间框架列表（如 ["5m", "15m"]）
+        config: 配置（可选）
+        
+    Returns:
+        多时间框架预测结果
+        
+    示例:
+        result = predict_multi_timeframe("BTCUSDT", ["5m", "15m"])
+        print(result['regimes']['5m']['most_likely_regime']['name'])
+        print(result['regimes']['15m']['most_likely_regime']['name'])
+    """
+    api = ModelAPI(config)
+    return api.predict_multi_timeframe(symbol, timeframes)
 
 
 def get_regime_probability(
     symbol: str,
     regime_name: str,
-    timeframe: str = "15m",
+    primary_timeframe: str = None,
     config: TrainingConfig = None
 ) -> float:
     """
@@ -392,7 +526,7 @@ def get_regime_probability(
     Args:
         symbol: 交易对
         regime_name: 状态名称
-        timeframe: 时间框架
+        primary_timeframe: 主时间框架
         config: 配置（可选）
         
     Returns:
@@ -403,7 +537,7 @@ def get_regime_probability(
         print(f"Strong_Trend 概率: {prob:.2%}")
     """
     api = ModelAPI(config)
-    return api.get_regime_probability(symbol, regime_name, timeframe)
+    return api.get_regime_probability(symbol, regime_name, primary_timeframe)
 
 
 # ==================== 主函数（示例） ====================

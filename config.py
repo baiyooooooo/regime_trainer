@@ -3,6 +3,7 @@
 """
 import os
 import sys
+import shutil
 import logging
 from datetime import datetime, timedelta
 
@@ -20,7 +21,30 @@ class TrainingConfig:
     
     # ============ 数据配置 ============
     TIMEFRAMES = ["5m", "15m", "1h"]
-    PRIMARY_TIMEFRAME = "15m"  # 主时间框架
+    PRIMARY_TIMEFRAME = "15m"  # 主时间框架（默认）
+    
+    # ============ 多时间框架模型配置 ============
+    # 支持同时训练和使用多个主时间框架的模型
+    # 每个配置定义一个独立的 regime 模型
+    MODEL_CONFIGS = {
+        "5m": {
+            "primary_timeframe": "5m",
+            "timeframes": ["1m", "5m", "15m"],  # 包含 1m 用于捕捉微观结构
+            "sequence_length": 48,  # 48根5m K线 = 4小时
+            "lstm_units": [64, 32],
+            "dense_units": [32],
+        },
+        "15m": {
+            "primary_timeframe": "15m",
+            "timeframes": ["5m", "15m", "1h"],
+            "sequence_length": 32,  # 32根15m K线 = 8小时
+            "lstm_units": [64, 32],
+            "dense_units": [32],
+        },
+    }
+    
+    # 启用的模型列表
+    ENABLED_MODELS = ["5m", "15m"]  # 同时启用 5m 和 15m 模型
     
     # 完整重训数据长度（天）
     FULL_RETRAIN_DAYS = 730  # 2年（2024-2025）- 增加数据量以改善类别不平衡
@@ -167,19 +191,84 @@ class TrainingConfig:
     CACHE_COMPRESSION = True  # 是否压缩存储
     
     @classmethod
-    def get_model_path(cls, symbol: str, model_type: str = "lstm") -> str:
-        """获取模型保存路径"""
-        return os.path.join(cls.MODELS_DIR, symbol, f"{model_type}_model.h5")
+    def get_model_path(cls, symbol: str, model_type: str = "lstm", primary_timeframe: str = None) -> str:
+        """
+        获取模型保存路径
+        
+        Args:
+            symbol: 交易对
+            model_type: 模型类型（lstm/hmm）
+            primary_timeframe: 主时间框架，如果为 None 则使用默认路径（向后兼容）
+            
+        Returns:
+            模型文件路径
+        """
+        if primary_timeframe:
+            return os.path.join(cls.MODELS_DIR, symbol, primary_timeframe, f"{model_type}_model.h5")
+        else:
+            # 向后兼容：检查新路径是否存在，如果不存在则使用旧路径
+            new_path = os.path.join(cls.MODELS_DIR, symbol, cls.PRIMARY_TIMEFRAME, f"{model_type}_model.h5")
+            old_path = os.path.join(cls.MODELS_DIR, symbol, f"{model_type}_model.h5")
+            if os.path.exists(new_path):
+                return new_path
+            return old_path
     
     @classmethod
-    def get_scaler_path(cls, symbol: str) -> str:
-        """获取标准化器保存路径"""
-        return os.path.join(cls.MODELS_DIR, symbol, "scaler.pkl")
+    def get_scaler_path(cls, symbol: str, primary_timeframe: str = None) -> str:
+        """
+        获取标准化器保存路径
+        
+        Args:
+            symbol: 交易对
+            primary_timeframe: 主时间框架，如果为 None 则使用默认路径（向后兼容）
+            
+        Returns:
+            Scaler 文件路径
+        """
+        if primary_timeframe:
+            return os.path.join(cls.MODELS_DIR, symbol, primary_timeframe, "scaler.pkl")
+        else:
+            new_path = os.path.join(cls.MODELS_DIR, symbol, cls.PRIMARY_TIMEFRAME, "scaler.pkl")
+            old_path = os.path.join(cls.MODELS_DIR, symbol, "scaler.pkl")
+            if os.path.exists(new_path):
+                return new_path
+            return old_path
     
     @classmethod
-    def get_hmm_path(cls, symbol: str) -> str:
-        """获取 HMM 模型保存路径"""
-        return os.path.join(cls.MODELS_DIR, symbol, "hmm_model.pkl")
+    def get_hmm_path(cls, symbol: str, primary_timeframe: str = None) -> str:
+        """
+        获取 HMM 模型保存路径
+        
+        Args:
+            symbol: 交易对
+            primary_timeframe: 主时间框架，如果为 None 则使用默认路径（向后兼容）
+            
+        Returns:
+            HMM 模型文件路径
+        """
+        if primary_timeframe:
+            return os.path.join(cls.MODELS_DIR, symbol, primary_timeframe, "hmm_model.pkl")
+        else:
+            new_path = os.path.join(cls.MODELS_DIR, symbol, cls.PRIMARY_TIMEFRAME, "hmm_model.pkl")
+            old_path = os.path.join(cls.MODELS_DIR, symbol, "hmm_model.pkl")
+            if os.path.exists(new_path):
+                return new_path
+            return old_path
+    
+    @classmethod
+    def get_model_config(cls, primary_timeframe: str) -> dict:
+        """
+        获取指定时间框架的模型配置
+        
+        Args:
+            primary_timeframe: 主时间框架（如 "5m" 或 "15m"）
+            
+        Returns:
+            模型配置字典
+        """
+        if primary_timeframe not in cls.MODEL_CONFIGS:
+            raise ValueError(f"不支持的时间框架: {primary_timeframe}，支持的值: {list(cls.MODEL_CONFIGS.keys())}")
+        return cls.MODEL_CONFIGS[primary_timeframe]
     
     @classmethod
     def ensure_dirs(cls):
@@ -190,6 +279,110 @@ class TrainingConfig:
         for symbol in cls.SYMBOLS:
             os.makedirs(os.path.join(cls.MODELS_DIR, symbol), exist_ok=True)
             os.makedirs(os.path.join(cls.DATA_DIR, symbol), exist_ok=True)
+            # 为每个启用的模型创建子目录
+            for tf in cls.ENABLED_MODELS:
+                os.makedirs(os.path.join(cls.MODELS_DIR, symbol, tf), exist_ok=True)
+    
+    @classmethod
+    def migrate_models_to_timeframe_dirs(cls, dry_run: bool = False) -> dict:
+        """
+        迁移旧版模型文件到时间框架子目录
+        
+        将 models/{symbol}/lstm_model.h5 等文件迁移到 models/{symbol}/15m/lstm_model.h5
+        
+        Args:
+            dry_run: 如果为 True，只返回要迁移的文件列表，不实际执行迁移
+            
+        Returns:
+            迁移结果字典：{"migrated": [...], "skipped": [...], "errors": [...]}
+        """
+        logger = logging.getLogger(__name__)
+        result = {"migrated": [], "skipped": [], "errors": []}
+        
+        # 需要迁移的文件
+        model_files = ["lstm_model.h5", "hmm_model.pkl", "scaler.pkl", "scaler_feature_names.pkl"]
+        
+        # 遍历所有交易对目录
+        if not os.path.exists(cls.MODELS_DIR):
+            return result
+        
+        for symbol_dir in os.listdir(cls.MODELS_DIR):
+            symbol_path = os.path.join(cls.MODELS_DIR, symbol_dir)
+            if not os.path.isdir(symbol_path):
+                continue
+            
+            # 检查是否有旧版模型文件（直接在 symbol 目录下）
+            old_files = []
+            for model_file in model_files:
+                old_path = os.path.join(symbol_path, model_file)
+                if os.path.exists(old_path):
+                    old_files.append(model_file)
+            
+            if not old_files:
+                continue
+            
+            # 检查是否已经有新版目录结构
+            new_dir = os.path.join(symbol_path, cls.PRIMARY_TIMEFRAME)
+            new_dir_exists = os.path.exists(new_dir) and any(
+                os.path.exists(os.path.join(new_dir, f)) for f in model_files
+            )
+            
+            if new_dir_exists:
+                # 新目录已存在且有文件，跳过迁移
+                for f in old_files:
+                    result["skipped"].append({
+                        "file": os.path.join(symbol_path, f),
+                        "reason": "新版目录已存在"
+                    })
+                continue
+            
+            # 执行迁移
+            if not dry_run:
+                os.makedirs(new_dir, exist_ok=True)
+            
+            for model_file in old_files:
+                old_path = os.path.join(symbol_path, model_file)
+                new_path = os.path.join(new_dir, model_file)
+                
+                try:
+                    if not dry_run:
+                        shutil.move(old_path, new_path)
+                    result["migrated"].append({
+                        "from": old_path,
+                        "to": new_path
+                    })
+                    logger.info(f"{'[DRY-RUN] ' if dry_run else ''}迁移: {old_path} -> {new_path}")
+                except Exception as e:
+                    result["errors"].append({
+                        "file": old_path,
+                        "error": str(e)
+                    })
+                    logger.error(f"迁移失败: {old_path} -> {new_path}, 错误: {e}")
+        
+        if result["migrated"]:
+            logger.info(f"{'[DRY-RUN] ' if dry_run else ''}迁移完成: {len(result['migrated'])} 个文件")
+        if result["skipped"]:
+            logger.info(f"跳过迁移: {len(result['skipped'])} 个文件（新版目录已存在）")
+        if result["errors"]:
+            logger.warning(f"迁移失败: {len(result['errors'])} 个文件")
+        
+        return result
+    
+    @classmethod
+    def check_model_exists(cls, symbol: str, primary_timeframe: str = None) -> bool:
+        """
+        检查指定模型是否存在
+        
+        Args:
+            symbol: 交易对
+            primary_timeframe: 主时间框架
+            
+        Returns:
+            模型是否存在
+        """
+        model_path = cls.get_model_path(symbol, "lstm", primary_timeframe)
+        scaler_path = cls.get_scaler_path(symbol, primary_timeframe)
+        return os.path.exists(model_path) and os.path.exists(scaler_path)
 
 
 def setup_logging(log_file: str = None, level: int = logging.INFO):

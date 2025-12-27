@@ -120,7 +120,7 @@ class TrainingPipeline:
         
         logger.info("=" * 70)
     
-    def full_retrain(self, symbol: str) -> Dict:
+    def full_retrain(self, symbol: str, primary_timeframe: str = None) -> Dict:
         """
         完整重训（从零开始）
         
@@ -131,19 +131,32 @@ class TrainingPipeline:
         
         Args:
             symbol: 交易对
+            primary_timeframe: 主时间框架（如 "5m" 或 "15m"），如果为 None 则使用默认配置
             
         Returns:
             训练结果
         """
+        # 获取模型配置
+        if primary_timeframe is None:
+            primary_timeframe = self.config.PRIMARY_TIMEFRAME
+        
+        model_config = self.config.get_model_config(primary_timeframe)
+        timeframes = model_config["timeframes"]
+        sequence_length = model_config["sequence_length"]
+        lstm_units = model_config.get("lstm_units", self.config.LSTM_UNITS)
+        dense_units = model_config.get("dense_units", self.config.DENSE_UNITS)
+        
         logger.info(f"="*80)
-        logger.info(f"开始完整重训: {symbol}")
+        logger.info(f"开始完整重训: {symbol} (primary_timeframe={primary_timeframe})")
+        logger.info(f"  时间框架: {timeframes}")
+        logger.info(f"  序列长度: {sequence_length}")
         logger.info(f"="*80)
         
         # 1. 获取数据
         logger.info("步骤 1/6: 获取历史数据...")
         data = self.data_fetcher.fetch_full_training_data(
             symbol=symbol,
-            timeframes=self.config.TIMEFRAMES,
+            timeframes=timeframes,
             days=self.config.FULL_RETRAIN_DAYS
         )
         # 注意：数据已自动保存到 SQLite 缓存中，无需额外保存
@@ -156,7 +169,7 @@ class TrainingPipeline:
         logger.info("步骤 2/6: 计算技术指标...")
         features = self.feature_engineer.combine_timeframe_features(
             data,
-            primary_timeframe=self.config.PRIMARY_TIMEFRAME,
+            primary_timeframe=primary_timeframe,
             symbol=symbol
         )
         
@@ -178,7 +191,7 @@ class TrainingPipeline:
         logger.info("步骤 4/6: HMM 状态标注（只在训练集上拟合）...")
         
         # 加载旧模型的映射（用于比对）
-        hmm_path = self.config.get_hmm_path(symbol)
+        hmm_path = self.config.get_hmm_path(symbol, primary_timeframe)
         old_mapping = None
         if os.path.exists(hmm_path):
             try:
@@ -191,7 +204,7 @@ class TrainingPipeline:
         hmm_labeler = HMMRegimeLabeler(
             n_states=self.config.N_STATES,
             n_components=self.config.N_PCA_COMPONENTS,
-            primary_timeframe=self.config.PRIMARY_TIMEFRAME
+            primary_timeframe=primary_timeframe
         )
         
         # 可选：BIC 验证状态数量是否合理
@@ -328,9 +341,9 @@ class TrainingPipeline:
         logger.info("步骤 5/6: 准备 LSTM 训练数据...")
         lstm_classifier = LSTMRegimeClassifier(
             n_states=self.config.N_STATES,
-            sequence_length=self.config.SEQUENCE_LENGTH,
-            lstm_units=self.config.LSTM_UNITS,
-            dense_units=self.config.DENSE_UNITS,
+            sequence_length=sequence_length,  # 使用模型配置的序列长度
+            lstm_units=lstm_units,  # 使用模型配置的 LSTM 单元数
+            dense_units=dense_units,  # 使用模型配置的 Dense 单元数
             dropout_rate=self.config.DROPOUT_RATE,
             l2_lambda=self.config.L2_LAMBDA,
             use_batch_norm=self.config.USE_BATCH_NORM,
@@ -349,7 +362,7 @@ class TrainingPipeline:
         
         # 6. 训练 LSTM
         logger.info("步骤 6/6: 训练 LSTM 模型...")
-        model_path = self.config.get_model_path(symbol)
+        model_path = self.config.get_model_path(symbol, "lstm", primary_timeframe)
         
         # 使用验证集进行早停和模型选择
         history = lstm_classifier.train(
@@ -378,14 +391,15 @@ class TrainingPipeline:
         logger.info(f"验证集准确率: {val_eval['accuracy']:.4f}")
         
         # 保存模型和标准化器
-        scaler_path = self.config.get_scaler_path(symbol)
+        scaler_path = self.config.get_scaler_path(symbol, primary_timeframe)
         lstm_classifier.save(model_path, scaler_path)
         
-        logger.info(f"完整重训完成: {symbol}")
+        logger.info(f"完整重训完成: {symbol} (primary_timeframe={primary_timeframe})")
         logger.info(f"测试集准确率: {eval_results['accuracy']:.4f}")
         
         return {
             'symbol': symbol,
+            'primary_timeframe': primary_timeframe,  # 新增：主时间框架
             'training_type': 'full_retrain',
             'timestamp': datetime.now(),
             'test_accuracy': eval_results['accuracy'],
@@ -401,6 +415,7 @@ class TrainingPipeline:
             'bic_validation': bic_validation,  # BIC 状态数量验证结果
             'n_states_optimization': n_states_optimization,  # 动态状态数量优化结果
             'final_n_states': hmm_labeler.n_states,  # 最终使用的状态数量
+            'sequence_length': sequence_length,  # 新增：序列长度
             'history': history,
             'data_split': {
                 'train_samples': len(train_features),
@@ -409,25 +424,33 @@ class TrainingPipeline:
             }
         }
     
-    def incremental_train(self, symbol: str) -> Dict:
+    def incremental_train(self, symbol: str, primary_timeframe: str = None) -> Dict:
         """
         增量训练（在现有模型基础上）
         
         Args:
             symbol: 交易对
+            primary_timeframe: 主时间框架（如 "5m" 或 "15m"），如果为 None 则使用默认配置
             
         Returns:
             训练结果
         """
+        # 获取模型配置
+        if primary_timeframe is None:
+            primary_timeframe = self.config.PRIMARY_TIMEFRAME
+        
+        model_config = self.config.get_model_config(primary_timeframe)
+        timeframes = model_config["timeframes"]
+        
         logger.info(f"="*80)
-        logger.info(f"开始增量训练: {symbol}")
+        logger.info(f"开始增量训练: {symbol} (primary_timeframe={primary_timeframe})")
         logger.info(f"="*80)
         
         # 1. 获取最新数据
         logger.info("步骤 1/4: 获取最新数据...")
         data = self.data_fetcher.fetch_latest_data(
             symbol=symbol,
-            timeframes=self.config.TIMEFRAMES,
+            timeframes=timeframes,
             days=self.config.INCREMENTAL_TRAIN_DAYS
         )
         
@@ -439,17 +462,17 @@ class TrainingPipeline:
         logger.info("步骤 2/4: 计算技术指标...")
         features = self.feature_engineer.combine_timeframe_features(
             data,
-            primary_timeframe=self.config.PRIMARY_TIMEFRAME,
+            primary_timeframe=primary_timeframe,
             symbol=symbol
         )
         
         # 3. 加载 HMM 模型并标注
         logger.info("步骤 3/4: HMM 状态标注...")
-        hmm_path = self.config.get_hmm_path(symbol)
+        hmm_path = self.config.get_hmm_path(symbol, primary_timeframe)
         
         if not os.path.exists(hmm_path):
             logger.warning(f"HMM 模型不存在，将执行完整重训: {hmm_path}")
-            return self.full_retrain(symbol)
+            return self.full_retrain(symbol, primary_timeframe)
         
         hmm_labeler = HMMRegimeLabeler.load(hmm_path)
         
@@ -493,12 +516,12 @@ class TrainingPipeline:
         
         # 4. 加载 LSTM 模型并增量训练
         logger.info("步骤 4/4: LSTM 增量训练...")
-        model_path = self.config.get_model_path(symbol)
-        scaler_path = self.config.get_scaler_path(symbol)
+        model_path = self.config.get_model_path(symbol, "lstm", primary_timeframe)
+        scaler_path = self.config.get_scaler_path(symbol, primary_timeframe)
         
         if not os.path.exists(model_path):
             logger.warning(f"LSTM 模型不存在，将执行完整重训: {model_path}")
-            return self.full_retrain(symbol)
+            return self.full_retrain(symbol, primary_timeframe)
         
         lstm_classifier = LSTMRegimeClassifier.load(model_path, scaler_path)
         
@@ -576,21 +599,23 @@ class TrainingPipeline:
         # 保存更新后的模型
         lstm_classifier.save(model_path, scaler_path)
         
-        logger.info(f"增量训练完成: {symbol}")
+        logger.info(f"增量训练完成: {symbol} (primary_timeframe={primary_timeframe})")
         
         return {
             'symbol': symbol,
+            'primary_timeframe': primary_timeframe,
             'training_type': 'incremental',
             'timestamp': datetime.now(),
             'samples_used': len(X)
         }
     
-    def train_all_symbols(self, training_type: str = 'full') -> Dict:
+    def train_all_symbols(self, training_type: str = 'full', primary_timeframe: str = None) -> Dict:
         """
         训练所有交易对
         
         Args:
             training_type: 'full' 或 'incremental'
+            primary_timeframe: 主时间框架（如 "5m" 或 "15m"），如果为 None 则使用默认配置
             
         Returns:
             所有交易对的训练结果
@@ -600,15 +625,87 @@ class TrainingPipeline:
         for symbol in self.config.SYMBOLS:
             try:
                 if training_type == 'full':
-                    result = self.full_retrain(symbol)
+                    result = self.full_retrain(symbol, primary_timeframe)
                 else:
-                    result = self.incremental_train(symbol)
+                    result = self.incremental_train(symbol, primary_timeframe)
                 
                 results[symbol] = result
                 
             except Exception as e:
                 logger.error(f"训练 {symbol} 时出错: {e}", exc_info=True)
                 results[symbol] = {'error': str(e)}
+        
+        return results
+    
+    def train_multi_timeframe_models(
+        self, 
+        symbol: str, 
+        timeframes: list = None, 
+        training_type: str = 'full'
+    ) -> Dict:
+        """
+        为单个交易对训练多个时间框架的模型
+        
+        Args:
+            symbol: 交易对
+            timeframes: 要训练的时间框架列表（如 ["5m", "15m"]），如果为 None 则使用 ENABLED_MODELS
+            training_type: 'full' 或 'incremental'
+            
+        Returns:
+            各时间框架的训练结果
+        """
+        if timeframes is None:
+            timeframes = self.config.ENABLED_MODELS
+        
+        results = {}
+        
+        for tf in timeframes:
+            logger.info(f"\n{'='*80}")
+            logger.info(f"训练 {symbol} 的 {tf} 模型...")
+            logger.info(f"{'='*80}\n")
+            
+            try:
+                if training_type == 'full':
+                    result = self.full_retrain(symbol, primary_timeframe=tf)
+                else:
+                    result = self.incremental_train(symbol, primary_timeframe=tf)
+                
+                results[tf] = result
+                
+            except Exception as e:
+                logger.error(f"训练 {symbol} 的 {tf} 模型时出错: {e}", exc_info=True)
+                results[tf] = {'error': str(e)}
+        
+        return results
+    
+    def train_all_multi_timeframe(
+        self, 
+        timeframes: list = None, 
+        training_type: str = 'full'
+    ) -> Dict:
+        """
+        为所有交易对训练多个时间框架的模型
+        
+        Args:
+            timeframes: 要训练的时间框架列表（如 ["5m", "15m"]），如果为 None 则使用 ENABLED_MODELS
+            training_type: 'full' 或 'incremental'
+            
+        Returns:
+            {symbol: {timeframe: result}} 格式的训练结果
+        """
+        if timeframes is None:
+            timeframes = self.config.ENABLED_MODELS
+        
+        results = {}
+        
+        for symbol in self.config.SYMBOLS:
+            logger.info(f"\n{'#'*80}")
+            logger.info(f"开始训练 {symbol} 的所有时间框架模型: {timeframes}")
+            logger.info(f"{'#'*80}\n")
+            
+            results[symbol] = self.train_multi_timeframe_models(
+                symbol, timeframes, training_type
+            )
         
         return results
 

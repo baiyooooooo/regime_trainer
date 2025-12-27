@@ -20,22 +20,31 @@ logger = logging.getLogger(__name__)
 class RealtimeRegimePredictor:
     """实时市场状态预测器"""
     
-    def __init__(self, symbol: str, config: TrainingConfig):
+    def __init__(self, symbol: str, config: TrainingConfig, primary_timeframe: str = None):
         """
         初始化
         
         Args:
             symbol: 交易对
             config: 配置
+            primary_timeframe: 主时间框架（如 "5m" 或 "15m"），如果为 None 则使用默认配置
         """
         self.symbol = symbol
         self.config = config
         self.data_fetcher = BinanceDataFetcher()
         self.feature_engineer = FeatureEngineer(cache_manager=self.data_fetcher.cache_manager)
         
+        # 获取模型配置
+        if primary_timeframe is None:
+            primary_timeframe = config.PRIMARY_TIMEFRAME
+        
+        self.primary_timeframe = primary_timeframe
+        self.model_config = config.get_model_config(primary_timeframe)
+        self.timeframes = self.model_config["timeframes"]
+        
         # 加载 LSTM 模型
-        model_path = config.get_model_path(symbol)
-        scaler_path = config.get_scaler_path(symbol)
+        model_path = config.get_model_path(symbol, "lstm", primary_timeframe)
+        scaler_path = config.get_scaler_path(symbol, primary_timeframe)
         
         if not os.path.exists(model_path) or not os.path.exists(scaler_path):
             raise FileNotFoundError(
@@ -43,10 +52,10 @@ class RealtimeRegimePredictor:
             )
         
         self.lstm_classifier = LSTMRegimeClassifier.load(model_path, scaler_path)
-        logger.info(f"已加载 {symbol} 的 LSTM 模型")
+        logger.info(f"已加载 {symbol} 的 LSTM 模型 (primary_timeframe={primary_timeframe})")
         
         # 加载 HMM 模型以获取状态映射
-        hmm_path = config.get_hmm_path(symbol)
+        hmm_path = config.get_hmm_path(symbol, primary_timeframe)
         self.regime_mapping = {}  # 默认空映射
         
         if os.path.exists(hmm_path):
@@ -127,12 +136,12 @@ class RealtimeRegimePredictor:
             
             data = self.data_fetcher.fetch_latest_data(
                 symbol=self.symbol,
-                timeframes=self.config.TIMEFRAMES,
+                timeframes=self.timeframes,
                 days=days
             )
             
             # 检查数据是否足够
-            primary_df = data.get(self.config.PRIMARY_TIMEFRAME, pd.DataFrame())
+            primary_df = data.get(self.primary_timeframe, pd.DataFrame())
             if len(primary_df) < self.lstm_classifier.sequence_length:
                 logger.warning(
                     f"数据量不足：只有 {len(primary_df)} 行，需要至少 {self.lstm_classifier.sequence_length} 行。"
@@ -142,7 +151,7 @@ class RealtimeRegimePredictor:
             # 2. 计算特征
             features = self.feature_engineer.combine_timeframe_features(
                 data,
-                primary_timeframe=self.config.PRIMARY_TIMEFRAME,
+                primary_timeframe=self.primary_timeframe,
                 symbol=self.symbol
             )
             
@@ -184,6 +193,7 @@ class RealtimeRegimePredictor:
             # 6. 返回结果
             result = {
                 'symbol': self.symbol,
+                'primary_timeframe': self.primary_timeframe,  # 新增：主时间框架
                 'timestamp': datetime.now(),
                 'regime_id': int(regime_id),
                 'regime_name': regime_name,
@@ -221,21 +231,21 @@ class RealtimeRegimePredictor:
             
             data = self.data_fetcher.fetch_latest_data(
                 symbol=self.symbol,
-                timeframes=self.config.TIMEFRAMES,
+                timeframes=self.timeframes,
                 days=days
             )
             
             # 计算特征
             features = self.feature_engineer.combine_timeframe_features(
                 data,
-                primary_timeframe=self.config.PRIMARY_TIMEFRAME,
+                primary_timeframe=self.primary_timeframe,
                 symbol=self.symbol
             )
             
             # 只取最近的数据（根据时间框架计算需要的行数）
             # 主时间框架是 15m，所以 24 小时 = 24 * 60 / 15 = 96 行
             # 但为了安全，我们获取更多数据以确保有足够的数据进行预测
-            timeframe_minutes = self._get_timeframe_minutes(self.config.PRIMARY_TIMEFRAME)
+            timeframe_minutes = self._get_timeframe_minutes(self.primary_timeframe)
             rows_needed = (lookback_hours * 60) // timeframe_minutes
             # 加上 sequence_length 以确保有足够的数据进行滑动窗口预测
             min_rows = rows_needed + self.lstm_classifier.sequence_length
@@ -309,25 +319,101 @@ class RealtimeRegimePredictor:
             raise
 
 
+class MultiTimeframeRegimePredictor:
+    """多时间框架市场状态预测器
+    
+    同时加载和预测多个时间框架的 regime，例如同时返回 5m 和 15m 的 regime。
+    """
+    
+    def __init__(self, symbol: str, config: TrainingConfig, timeframes: list = None):
+        """
+        初始化
+        
+        Args:
+            symbol: 交易对
+            config: 配置
+            timeframes: 要加载的时间框架列表（如 ["5m", "15m"]），如果为 None 则使用 ENABLED_MODELS
+        """
+        self.symbol = symbol
+        self.config = config
+        
+        if timeframes is None:
+            timeframes = config.ENABLED_MODELS
+        
+        self.timeframes = timeframes
+        self.predictors = {}
+        
+        # 为每个时间框架创建预测器
+        for tf in timeframes:
+            try:
+                self.predictors[tf] = RealtimeRegimePredictor(symbol, config, primary_timeframe=tf)
+                logger.info(f"已加载 {symbol} 的 {tf} 模型")
+            except FileNotFoundError as e:
+                logger.warning(f"无法为 {symbol} 加载 {tf} 模型: {e}")
+    
+    def get_current_regimes(self) -> Dict:
+        """
+        获取所有时间框架的当前市场状态
+        
+        Returns:
+            {timeframe: prediction_result} 格式的字典
+        """
+        results = {
+            'symbol': self.symbol,
+            'timestamp': datetime.now(),
+            'regimes': {}
+        }
+        
+        for tf, predictor in self.predictors.items():
+            try:
+                results['regimes'][tf] = predictor.get_current_regime()
+            except Exception as e:
+                logger.error(f"获取 {self.symbol} 的 {tf} 状态失败: {e}")
+                results['regimes'][tf] = {'error': str(e)}
+        
+        return results
+    
+    def get_regime(self, timeframe: str) -> Dict:
+        """
+        获取指定时间框架的当前市场状态
+        
+        Args:
+            timeframe: 时间框架（如 "5m" 或 "15m"）
+            
+        Returns:
+            预测结果字典
+        """
+        if timeframe not in self.predictors:
+            raise ValueError(f"时间框架 {timeframe} 未加载，可用的时间框架: {list(self.predictors.keys())}")
+        
+        return self.predictors[timeframe].get_current_regime()
+    
+    def has_timeframe(self, timeframe: str) -> bool:
+        """检查是否加载了指定时间框架的模型"""
+        return timeframe in self.predictors
+
+
 class MultiSymbolRegimeTracker:
     """多交易对市场状态跟踪器"""
     
-    def __init__(self, symbols: list, config: TrainingConfig):
+    def __init__(self, symbols: list, config: TrainingConfig, primary_timeframe: str = None):
         """
         初始化
         
         Args:
             symbols: 交易对列表
             config: 配置
+            primary_timeframe: 主时间框架（如 "5m" 或 "15m"），如果为 None 则使用默认配置
         """
         self.symbols = symbols
         self.config = config
+        self.primary_timeframe = primary_timeframe
         self.predictors = {}
         
         # 为每个交易对创建预测器
         for symbol in symbols:
             try:
-                self.predictors[symbol] = RealtimeRegimePredictor(symbol, config)
+                self.predictors[symbol] = RealtimeRegimePredictor(symbol, config, primary_timeframe)
             except FileNotFoundError as e:
                 logger.warning(f"无法为 {symbol} 创建预测器: {e}")
     

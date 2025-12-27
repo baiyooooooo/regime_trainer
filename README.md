@@ -8,8 +8,9 @@
 - 🔄 **自动化训练**：增量训练（每天2次）+ 完整重训（每周1次）
 - 📊 **6种市场状态**：Strong_Trend, Weak_Trend, Range, Choppy_High_Vol, Volatility_Spike, Squeeze
 - 🔌 **简单API接口**：供其他项目调用
+- ⚡ **多时间框架支持**：独立的 5m 和 15m 模型，可并行预测
 
-**重要说明**：LSTM模型使用过去64根K线的特征序列，预测下一根K线的market regime。这是单步预测，不能直接预测多根K线。
+**重要说明**：LSTM模型使用过去N根K线的特征序列，预测下一根K线的market regime。这是单步预测，不能直接预测多根K线。
 
 ## 快速开始
 
@@ -22,8 +23,15 @@ pip install -r requirements.txt
 ### 2. 首次训练
 
 ```bash
-python examples.py 1  # 训练单个交易对
-# 或
+# 15m 模型（默认）
+python examples.py 1   # 训练单个交易对 15m 模型
+python examples.py 2   # 批量训练所有交易对 15m 模型
+
+# 5m 模型（快速决策）
+python examples.py 7   # 训练单个交易对 5m 模型
+python examples.py 13  # 批量训练所有交易对 5m 模型
+
+# 或直接运行训练管道
 python training_pipeline.py  # 训练所有交易对
 ```
 
@@ -37,6 +45,9 @@ result = predict_regime("BTCUSDT", "15m")
 
 print(f"最可能的状态: {result['most_likely_regime']['name']}")
 print(f"概率: {result['most_likely_regime']['probability']:.2%}")
+
+# 预测下一根5分钟K线的market regime（需要先训练5m模型）
+result_5m = predict_regime("BTCUSDT", "5m")
 ```
 
 ## API 使用指南
@@ -175,7 +186,53 @@ results = api.batch_predict(
 }
 ```
 
+#### 5. 多时间框架并行预测
+
+```python
+api = ModelAPI()
+
+# Request - 同时获取 5m 和 15m 的预测结果
+results = api.predict_multi_timeframe_regimes(
+    symbol="BTCUSDT",
+    timeframes=["5m", "15m"]
+)
+
+# Response
+{
+    '5m': {
+        'symbol': 'BTCUSDT',
+        'regime_name': 'Strong_Trend',
+        'confidence': 0.42,
+        'probabilities': {...},
+        ...
+    },
+    '15m': {
+        'symbol': 'BTCUSDT',
+        'regime_name': 'Weak_Trend',
+        'confidence': 0.38,
+        'probabilities': {...},
+        ...
+    }
+}
+```
+
+这在以下场景特别有用：
+- **短期决策**：5m 模型捕捉快速变化，适合 3-5 分钟决策周期
+- **趋势确认**：对比 5m 和 15m 状态是否一致，判断趋势强度
+- **入场时机**：15m 确认大方向，5m 寻找精确入场点
+
 ## 模型参数
+
+### 多时间框架配置
+
+系统支持独立的 5m 和 15m 模型，每个时间框架有优化的参数：
+
+| 参数 | 5m 模型 | 15m 模型 | 说明 |
+|------|---------|----------|------|
+| `SEQUENCE_LENGTH` | 48 | 64 | 输入序列长度（K线数量） |
+| `timeframes` | 1m, 5m, 15m | 5m, 15m, 1h | 特征使用的时间框架 |
+| `LSTM_UNITS` | [96, 48] | [128, 64] | LSTM层单元数 |
+| `覆盖时间` | 4小时 | 16小时 | 输入数据覆盖的时间范围 |
 
 ### HMM 模型参数
 
@@ -183,9 +240,8 @@ results = api.batch_predict(
 |------|-----|------|
 | `N_STATES` | 6 | 市场状态数量 |
 | `N_PCA_COMPONENTS` | 5 | PCA降维后的特征数 |
-| `PRIMARY_TIMEFRAME` | "15m" | 主时间框架 |
 
-### LSTM 模型参数
+### LSTM 模型参数（默认值）
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
@@ -251,11 +307,16 @@ from config import TrainingConfig
 
 pipeline = TrainingPipeline(TrainingConfig)
 
-# 完整重训
-result = pipeline.full_retrain("BTCUSDT")
+# 15m 模型训练（默认）
+result = pipeline.full_retrain("BTCUSDT")                    # 完整重训
+result = pipeline.incremental_train("BTCUSDT")               # 增量训练
 
-# 增量训练
-result = pipeline.incremental_train("BTCUSDT")
+# 5m 模型训练
+result = pipeline.full_retrain("BTCUSDT", primary_timeframe="5m")      # 完整重训
+result = pipeline.incremental_train("BTCUSDT", primary_timeframe="5m") # 增量训练
+
+# 训练所有时间框架的所有交易对
+results = pipeline.train_all_multi_timeframe()
 ```
 
 ## 项目结构
@@ -274,7 +335,17 @@ regime_trainer/
 ├── examples.py             # 使用示例
 ├── test_api.py            # API测试脚本
 ├── API_USAGE.md           # 详细API文档
-└── README.md              # 本文档
+├── README.md              # 本文档
+└── models/                  # 模型存储目录
+    └── BTCUSDT/
+        ├── 5m/              # 5m 时间框架模型
+        │   ├── lstm_model.h5
+        │   ├── hmm_model.pkl
+        │   └── scaler.pkl
+        └── 15m/             # 15m 时间框架模型
+            ├── lstm_model.h5
+            ├── hmm_model.pkl
+            └── scaler.pkl
 ```
 
 ## 配置交易对
@@ -295,7 +366,7 @@ SYMBOLS = [
 
 **Q: 如何知道哪些交易对有可用的模型？**
 
-A: 使用 `api.list_available_models()` 方法。
+A: 使用 `api.list_available_models()` 方法，返回按时间框架分组的可用模型列表。
 
 **Q: 预测结果中的概率分布是什么意思？**
 
@@ -303,11 +374,67 @@ A: 每个概率表示该状态在未来N根K线中出现的可能性。所有概
 
 **Q: 可以预测其他时间框架吗？**
 
-A: 目前只支持训练时使用的主时间框架（默认15m）。要支持其他时间框架，需要重新训练模型。
+A: 系统支持 5m 和 15m 两种时间框架。需要分别训练对应的模型：
+```python
+# 训练 5m 模型
+python examples.py 7
+
+# 使用 5m 模型预测
+result = predict_regime("BTCUSDT", "5m")
+```
+
+**Q: 5m 和 15m 模型有什么区别？应该用哪个？**
+
+A: 
+- **5m 模型**：更敏感，能快速捕捉市场变化，适合 3-5 分钟决策周期
+- **15m 模型**：更稳定，过滤短期噪音，适合中期趋势判断
+
+建议同时使用两个模型，用 `api.predict_multi_timeframe_regimes()` 并行预测，对比两者是否一致来判断信号强度。
 
 **Q: 如何更新模型？**
 
 A: 使用 `training_pipeline.py` 进行增量训练或完整重训。训练完成后，API会自动使用新的模型。
+
+**Q: 如何同时获取 5m 和 15m 的预测？**
+
+A: 使用多时间框架预测接口：
+```python
+from model_api import ModelAPI
+api = ModelAPI()
+results = api.predict_multi_timeframe_regimes("BTCUSDT", ["5m", "15m"])
+```
+
+## 示例脚本
+
+运行 `python examples.py` 显示交互式菜单，或直接指定示例编号：
+
+### 15m 时间框架（默认）
+
+| 编号 | 功能 | 命令 |
+|------|------|------|
+| 1 | 训练单个交易对 (BTCUSDT) | `python examples.py 1` |
+| 2 | 批量训练多个交易对 | `python examples.py 2` |
+| 3 | 实时市场状态预测 | `python examples.py 3` |
+| 4 | 查看历史市场状态变化 | `python examples.py 4` |
+| 5 | 多交易对市场状态跟踪 | `python examples.py 5` |
+| 6 | 增量训练 | `python examples.py 6` |
+
+### 5m 时间框架（快速决策）
+
+| 编号 | 功能 | 命令 |
+|------|------|------|
+| 7 | 训练单个交易对 5m 模型 | `python examples.py 7` |
+| 8 | 5m 实时市场状态预测 | `python examples.py 8` |
+| 9 | 5m 增量训练 | `python examples.py 9` |
+| 10 | 5m 历史市场状态变化 | `python examples.py 10` |
+| 12 | 5m 多交易对市场状态跟踪 | `python examples.py 12` |
+| 13 | 批量训练多个交易对 5m 模型 | `python examples.py 13` |
+
+### 多时间框架
+
+| 编号 | 功能 | 命令 |
+|------|------|------|
+| 11 | 多时间框架并行预测 (5m + 15m) | `python examples.py 11` |
 
 ## 详细文档
 
