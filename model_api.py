@@ -2,11 +2,12 @@
 模型 API 模块 - 为其他项目提供简单的预测接口
 
 这个模块提供了简单的接口，让其他项目可以方便地：
-1. 预测下一根K线的market regime概率分布
-2. 获取模型元数据（状态映射、时间框架等）
-3. 查询可用的交易对和模型信息
+1. 预测未来多根K线的market regime概率分布（t+1 到 t+4）
+2. 获取历史regime序列（过去N根K线）
+3. 获取模型元数据（状态映射、时间框架等）
+4. 查询可用的交易对和模型信息
 
-注意：LSTM模型只能预测下一根K线的market regime，不能预测多根K线。
+注意：模型支持多步预测（t+1 到 t+4），同时提供历史regime序列。
 """
 import logging
 import os
@@ -100,6 +101,107 @@ class ModelAPI:
         
         return self._multi_tf_predictors[cache_key]
     
+    def predict_regimes(
+        self,
+        symbol: str,
+        primary_timeframe: str = None,
+        include_history: bool = True,
+        history_bars: int = 16
+    ) -> Dict:
+        """
+        预测未来多根 K 线的 market regime 概率分布（支持 t+1 到 t+4）
+        
+        这是推荐的新 API 方法，同时返回：
+        - 历史 regime 序列（过去 N 根 K 线的状态）
+        - 未来 4 步预测（t+1 到 t+4 的概率分布）
+        
+        Args:
+            symbol: 交易对（如 "BTCUSDT"）
+            primary_timeframe: 主时间框架（如 "5m", "15m"），如果为 None 则使用默认配置
+            include_history: 是否包含历史 regime 序列
+            history_bars: 历史序列的 K 线数量（默认 16 根，对于 15m 约为 4 小时）
+            
+        Returns:
+            包含预测结果的字典:
+            {
+                'symbol': str,
+                'timeframe': str,
+                'timestamp': datetime,
+                'historical_regimes': {  # 历史 regime 序列
+                    'sequence': ['Range', 'Range', 'Weak_Trend', ...],
+                    'timestamps': [...],
+                    'confidences': [...],
+                    'count': 16,
+                    'lookback_hours': 4.0
+                },
+                'predictions': {  # 多步预测
+                    't+1': {
+                        'probabilities': {...},
+                        'most_likely': str,
+                        'confidence': float,
+                        'is_uncertain': bool
+                    },
+                    't+2': {...},
+                    't+3': {...},
+                    't+4': {...}
+                },
+                'is_multistep': bool,  # 是否多步模型
+                'model_info': {...}
+            }
+        """
+        if primary_timeframe is None:
+            primary_timeframe = self.config.PRIMARY_TIMEFRAME
+        
+        # 获取预测器
+        predictor = self._get_predictor(symbol, primary_timeframe)
+        
+        # 获取完整预测结果（包括多步预测和历史序列）
+        current_regime = predictor.get_current_regime()
+        
+        # 获取模型元数据
+        model_info = self._get_model_info(predictor)
+        model_info['sequence_length'] = predictor.lstm_classifier.sequence_length
+        model_info['is_multistep'] = True  # 现在总是多步预测
+        model_info['prediction_horizons'] = predictor.lstm_classifier.prediction_horizons
+        
+        # 构建预测结果
+        predictions = {}
+        for horizon, pred in current_regime.get('predictions', {}).items():
+            predictions[horizon] = {
+                'probabilities': pred['probabilities'],
+                'most_likely': pred['regime_name'],
+                'regime_id': pred['regime_id'],
+                'confidence': pred['confidence'],
+                'is_uncertain': pred['is_uncertain']
+            }
+        
+        # 构建结果
+        result = {
+            'symbol': symbol,
+            'timeframe': primary_timeframe,
+            'timestamp': datetime.now(),
+            'predictions': predictions,
+            'is_multistep': True,  # 现在总是多步预测
+            'model_info': model_info
+        }
+        
+        # 添加历史 regime 序列
+        if include_history:
+            result['historical_regimes'] = current_regime.get('historical_regimes', {})
+        
+        # 日志输出
+        if predictions.get('t+1'):
+            t1 = predictions['t+1']
+            logger.info(
+                f"{symbol} 多步预测: t+1={t1['most_likely']} ({t1['confidence']:.2%})"
+            )
+            for h in ['t+2', 't+3', 't+4']:
+                if h in predictions:
+                    p = predictions[h]
+                    logger.debug(f"  {h}: {p['most_likely']} ({p['confidence']:.2%})")
+        
+        return result
+    
     def predict_next_regime(
         self,
         symbol: str,
@@ -107,12 +209,11 @@ class ModelAPI:
         primary_timeframe: str = None
     ) -> Dict:
         """
-        预测下一根K线的market regime概率分布
+        预测下一根K线的market regime概率分布（向后兼容的接口）
         
-        重要说明：
-        - LSTM模型训练时预测的是"下一根K线"的状态
-        - 模型使用过去64根K线的特征序列来预测下一根K线的状态
-        - 这是单步预测，不能直接预测多根K线
+        注意：此方法保留用于向后兼容。推荐使用 predict_regimes() 方法以获取多步预测。
+        
+        对于多步模型，此方法只返回 t+1 的预测结果。
         
         Args:
             symbol: 交易对（如 "BTCUSDT"）
@@ -120,30 +221,7 @@ class ModelAPI:
             primary_timeframe: 主时间框架（如 "5m", "15m"），如果为 None 则使用默认配置
             
         Returns:
-            包含预测结果的字典:
-            {
-                'symbol': str,  # 交易对
-                'timeframe': str,  # 时间框架
-                'timestamp': datetime,  # 预测时间
-                'regime_probabilities': {  # 各状态的概率分布
-                    'State_0': float,  # 或语义名称如 'Strong_Trend'
-                    'State_1': float,
-                    ...
-                },
-                'most_likely_regime': {  # 最可能的状态
-                    'id': int,
-                    'name': str,
-                    'probability': float
-                },
-                'confidence': float,  # 置信度（最高概率）
-                'is_uncertain': bool,  # 是否不确定（置信度过低）
-                'model_info': {  # 模型信息
-                    'primary_timeframe': str,
-                    'n_states': int,
-                    'regime_mapping': dict,
-                    'sequence_length': int  # 使用的历史K线数量
-                }
-            }
+            包含预测结果的字典（只包含 t+1 预测，向后兼容格式）
         """
         # 处理 timeframe 参数（向后兼容）
         if primary_timeframe is None:
@@ -156,10 +234,10 @@ class ModelAPI:
         predictor = self._get_predictor(symbol, primary_timeframe)
         timeframe = primary_timeframe  # 用于返回结果
         
-        # 获取当前市场状态预测（实际上是预测下一根K线）
+        # 获取当前市场状态预测
         current_regime = predictor.get_current_regime()
         
-        # 提取概率分布
+        # 提取概率分布（t+1）
         regime_probs = current_regime['probabilities']
         
         # 找到最可能的状态
@@ -171,7 +249,7 @@ class ModelAPI:
         model_info = self._get_model_info(predictor)
         model_info['sequence_length'] = predictor.lstm_classifier.sequence_length
         
-        # 构建结果
+        # 构建结果（向后兼容格式）
         result = {
             'symbol': symbol,
             'timeframe': timeframe,
@@ -204,21 +282,20 @@ class ModelAPI:
         """
         [已废弃] 预测未来N根K线的market regime概率分布
         
-        注意：此方法已废弃。模型实际上只能预测下一根K线。
-        请使用 predict_next_regime() 方法。
+        注意：此方法已废弃。请使用 predict_regimes() 方法以获取多步预测（t+1 到 t+4）。
         
         Args:
             symbol: 交易对
             timeframe: 时间框架
-            n_bars: 已废弃，将被忽略（模型只能预测1根K线）
+            n_bars: 已废弃，将被忽略
             
         Returns:
-            预测结果（实际只预测下一根K线）
+            预测结果（只返回 t+1 预测）
         """
         if n_bars != 1:
             logger.warning(
-                f"predict_future_regimes() 中的 n_bars={n_bars} 参数将被忽略。"
-                f"模型只能预测下一根K线。请使用 predict_next_regime() 方法。"
+                f"predict_future_regimes() 已废弃。"
+                f"请使用 predict_regimes() 方法以获取多步预测（t+1 到 t+4）。"
             )
         
         return self.predict_next_regime(symbol, timeframe)
@@ -305,17 +382,19 @@ class ModelAPI:
             'regime_mapping': regime_mapping
         }
     
-    def predict_multi_timeframe(
+    def predict_multi_timeframe_regimes(
         self,
         symbol: str,
-        timeframes: List[str] = None
+        timeframes: List[str] = None,
+        include_history: bool = True
     ) -> Dict:
         """
-        同时预测多个时间框架的 market regime
+        同时预测多个时间框架的 market regime（多步预测）
         
         Args:
             symbol: 交易对
             timeframes: 时间框架列表（如 ["5m", "15m"]），如果为 None 则使用 ENABLED_MODELS
+            include_history: 是否包含历史regime序列
             
         Returns:
             包含多个时间框架预测结果的字典:
@@ -323,8 +402,8 @@ class ModelAPI:
                 'symbol': str,
                 'timestamp': datetime,
                 'regimes': {
-                    '5m': {...预测结果...},
-                    '15m': {...预测结果...}
+                    '5m': {...多步预测结果...},
+                    '15m': {...多步预测结果...}
                 }
             }
         """
@@ -339,13 +418,36 @@ class ModelAPI:
         
         for tf in timeframes:
             try:
-                result = self.predict_next_regime(symbol, primary_timeframe=tf)
+                result = self.predict_regimes(
+                    symbol=symbol,
+                    primary_timeframe=tf,
+                    include_history=include_history
+                )
                 results['regimes'][tf] = result
             except Exception as e:
                 logger.error(f"预测 {symbol} 的 {tf} regime 失败: {e}")
                 results['regimes'][tf] = {'error': str(e)}
         
         return results
+    
+    def predict_multi_timeframe(
+        self,
+        symbol: str,
+        timeframes: List[str] = None
+    ) -> Dict:
+        """
+        [已废弃] 同时预测多个时间框架的 market regime
+        
+        注意：此方法已废弃，请使用 predict_multi_timeframe_regimes() 以获取多步预测。
+        
+        Args:
+            symbol: 交易对
+            timeframes: 时间框架列表（如 ["5m", "15m"]），如果为 None 则使用 ENABLED_MODELS
+            
+        Returns:
+            包含多个时间框架预测结果的字典（只包含 t+1 预测）
+        """
+        return self.predict_multi_timeframe_regimes(symbol, timeframes, include_history=False)
     
     def list_available_models(self, primary_timeframe: str = None) -> List[str]:
         """

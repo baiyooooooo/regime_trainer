@@ -1,303 +1,312 @@
 """
-测试 Model API 功能
+API 测试脚本 - 验证多步预测 API 工作正常
 """
 import sys
 import logging
-from model_api import ModelAPI, predict_regime, get_regime_probability
-from config import TrainingConfig, setup_logging
+from datetime import datetime
+from model_api import ModelAPI
+from config import TrainingConfig
 
-setup_logging(level=logging.INFO)
+# 设置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
-def test_list_models():
-    """测试列出可用模型"""
-    print("\n" + "="*70)
-    print("测试 1: 列出可用的模型")
-    print("="*70)
-    
-    api = ModelAPI()
-    available = api.list_available_models()
-    
-    if not available:
-        print("⚠️  没有可用的模型")
-        print("   请先运行训练（python examples.py 1）")
-        return False
-    
-    print(f"✓ 找到 {len(available)} 个可用模型:")
-    for symbol in available:
-        print(f"  - {symbol}")
-    
-    return True
-
-
-def test_predict_regime(symbol: str = None):
-    """测试预测market regime"""
-    print("\n" + "="*70)
-    print("测试 2: 预测下一根K线的market regime")
-    print("="*70)
-    
-    api = ModelAPI()
-    available = api.list_available_models()
-    
-    if not available:
-        print("⚠️  没有可用的模型，跳过测试")
-        return False
-    
-    if symbol is None:
-        symbol = available[0]
-    
-    if symbol not in available:
-        print(f"⚠️  {symbol} 的模型不存在，使用 {available[0]}")
-        symbol = available[0]
+def test_predict_regimes():
+    """测试 predict_regimes() API"""
+    print("\n" + "="*80)
+    print("测试 1: predict_regimes() - 多步预测 API")
+    print("="*80)
     
     try:
-        result = api.predict_next_regime(symbol, "15m")
+        api = ModelAPI()
         
-        print(f"\n✓ 预测成功:")
-        print(f"  交易对: {result['symbol']}")
-        print(f"  时间框架: {result['timeframe']}")
-        print(f"  预测时间: {result['timestamp']}")
-        print(f"  使用历史K线数: {result['model_info']['sequence_length']}")
-        print(f"\n  最可能的状态: {result['most_likely_regime']['name']}")
-        print(f"  概率: {result['most_likely_regime']['probability']:.2%}")
-        print(f"  置信度: {result['confidence']:.2%}")
+        # 检查可用模型
+        available = api.list_available_models()
+        if not available:
+            print("❌ 没有可用的模型，请先训练模型")
+            return False
         
-        print(f"\n  所有状态概率分布:")
-        for regime_name, prob in sorted(
-            result['regime_probabilities'].items(),
-            key=lambda x: x[1],
-            reverse=True
-        ):
-            bar = "█" * int(prob * 50)
-            print(f"    {regime_name:25s} {prob:6.2%} {bar}")
+        symbol = available[0]
+        print(f"\n使用交易对: {symbol}")
+        
+        # 测试多步预测
+        result = api.predict_regimes(
+            symbol=symbol,
+            primary_timeframe="15m",
+            include_history=True,
+            history_bars=16
+        )
+        
+        # 验证返回结构
+        assert 'symbol' in result, "缺少 'symbol' 字段"
+        assert 'timeframe' in result, "缺少 'timeframe' 字段"
+        assert 'timestamp' in result, "缺少 'timestamp' 字段"
+        assert 'predictions' in result, "缺少 'predictions' 字段"
+        assert 'is_multistep' in result, "缺少 'is_multistep' 字段"
+        assert result['is_multistep'] == True, "is_multistep 应该为 True"
+        
+        # 验证多步预测
+        predictions = result['predictions']
+        assert 't+1' in predictions, "缺少 t+1 预测"
+        assert 't+2' in predictions, "缺少 t+2 预测"
+        assert 't+3' in predictions, "缺少 t+3 预测"
+        assert 't+4' in predictions, "缺少 t+4 预测"
+        
+        # 验证每个预测的结构
+        for horizon in ['t+1', 't+2', 't+3', 't+4']:
+            pred = predictions[horizon]
+            assert 'probabilities' in pred, f"{horizon} 缺少 'probabilities'"
+            assert 'most_likely' in pred, f"{horizon} 缺少 'most_likely'"
+            assert 'confidence' in pred, f"{horizon} 缺少 'confidence'"
+            assert 'is_uncertain' in pred, f"{horizon} 缺少 'is_uncertain'"
+            
+            # 验证概率和为1
+            prob_sum = sum(pred['probabilities'].values())
+            assert abs(prob_sum - 1.0) < 0.01, f"{horizon} 概率和不为1: {prob_sum}"
+        
+        # 验证历史序列
+        if 'historical_regimes' in result:
+            hist = result['historical_regimes']
+            assert 'sequence' in hist, "历史序列缺少 'sequence'"
+            assert 'lookback_hours' in hist, "历史序列缺少 'lookback_hours'"
+        
+        print("\n✅ predict_regimes() 测试通过!")
+        print(f"  - 交易对: {result['symbol']}")
+        print(f"  - 时间框架: {result['timeframe']}")
+        print(f"  - 多步预测: {result['is_multistep']}")
+        print(f"  - t+1 预测: {predictions['t+1']['most_likely']} ({predictions['t+1']['confidence']:.2%})")
+        print(f"  - t+2 预测: {predictions['t+2']['most_likely']} ({predictions['t+2']['confidence']:.2%})")
+        print(f"  - t+3 预测: {predictions['t+3']['most_likely']} ({predictions['t+3']['confidence']:.2%})")
+        print(f"  - t+4 预测: {predictions['t+4']['most_likely']} ({predictions['t+4']['confidence']:.2%})")
+        
+        if 'historical_regimes' in result:
+            hist = result['historical_regimes']
+            print(f"  - 历史序列: {len(hist.get('sequence', []))} 根K线")
         
         return True
         
     except Exception as e:
-        print(f"❌ 预测失败: {e}")
-        logger.exception("预测失败")
+        print(f"\n❌ predict_regimes() 测试失败: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
-def test_get_regime_probability(symbol: str = None):
-    """测试获取特定状态的概率"""
-    print("\n" + "="*70)
-    print("测试 3: 获取特定状态的概率")
-    print("="*70)
-    
-    api = ModelAPI()
-    available = api.list_available_models()
-    
-    if not available:
-        print("⚠️  没有可用的模型，跳过测试")
-        return False
-    
-    if symbol is None:
-        symbol = available[0]
-    
-    if symbol not in available:
-        symbol = available[0]
+def test_predict_next_regime():
+    """测试 predict_next_regime() API（向后兼容）"""
+    print("\n" + "="*80)
+    print("测试 2: predict_next_regime() - 向后兼容 API")
+    print("="*80)
     
     try:
-        # 测试获取几个状态的概率
-        regime_names = ["Strong_Trend", "Range", "Volatility_Spike"]
+        api = ModelAPI()
         
-        print(f"\n✓ 获取 {symbol} 下一根K线的状态概率:")
-        for regime_name in regime_names:
-            prob = api.get_regime_probability(symbol, regime_name)
-            print(f"  {regime_name:25s} {prob:6.2%}")
+        available = api.list_available_models()
+        if not available:
+            print("❌ 没有可用的模型")
+            return False
+        
+        symbol = available[0]
+        
+        result = api.predict_next_regime(
+            symbol=symbol,
+            primary_timeframe="15m"
+        )
+        
+        # 验证返回结构
+        assert 'symbol' in result, "缺少 'symbol' 字段"
+        assert 'timeframe' in result, "缺少 'timeframe' 字段"
+        assert 'regime_probabilities' in result, "缺少 'regime_probabilities' 字段"
+        assert 'most_likely_regime' in result, "缺少 'most_likely_regime' 字段"
+        assert 'confidence' in result, "缺少 'confidence' 字段"
+        
+        # 验证概率和为1
+        prob_sum = sum(result['regime_probabilities'].values())
+        assert abs(prob_sum - 1.0) < 0.01, f"概率和不为1: {prob_sum}"
+        
+        print("\n✅ predict_next_regime() 测试通过!")
+        print(f"  - 交易对: {result['symbol']}")
+        print(f"  - 最可能状态: {result['most_likely_regime']['name']}")
+        print(f"  - 概率: {result['most_likely_regime']['probability']:.2%}")
+        print(f"  - 置信度: {result['confidence']:.2%}")
         
         return True
         
     except Exception as e:
-        print(f"❌ 获取概率失败: {e}")
-        logger.exception("获取概率失败")
+        print(f"\n❌ predict_next_regime() 测试失败: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
-def test_get_metadata(symbol: str = None):
-    """测试获取模型元数据"""
-    print("\n" + "="*70)
-    print("测试 4: 获取模型元数据")
-    print("="*70)
-    
-    api = ModelAPI()
-    available = api.list_available_models()
-    
-    if not available:
-        print("⚠️  没有可用的模型，跳过测试")
-        return False
-    
-    if symbol is None:
-        symbol = available[0]
-    
-    if symbol not in available:
-        symbol = available[0]
+def test_predict_multi_timeframe_regimes():
+    """测试 predict_multi_timeframe_regimes() API"""
+    print("\n" + "="*80)
+    print("测试 3: predict_multi_timeframe_regimes() - 多时间框架多步预测")
+    print("="*80)
     
     try:
-        metadata = api.get_model_metadata(symbol)
+        api = ModelAPI()
         
-        print(f"\n✓ 模型元数据:")
-        print(f"  交易对: {metadata['symbol']}")
-        print(f"  主时间框架: {metadata['primary_timeframe']}")
-        print(f"  状态数量: {metadata['n_states']}")
-        print(f"  状态映射: {metadata['regime_mapping']}")
-        print(f"  状态名称列表: {metadata['regime_names']}")
-        print(f"  序列长度: {metadata['training_info']['sequence_length']}")
-        if metadata['training_info']['feature_count']:
-            print(f"  特征数量: {metadata['training_info']['feature_count']}")
+        available = api.list_available_models()
+        if not available:
+            print("❌ 没有可用的模型")
+            return False
+        
+        symbol = available[0]
+        
+        # 测试多时间框架预测
+        result = api.predict_multi_timeframe_regimes(
+            symbol=symbol,
+            timeframes=["15m"],  # 只测试一个时间框架
+            include_history=True
+        )
+        
+        assert 'symbol' in result, "缺少 'symbol' 字段"
+        assert 'regimes' in result, "缺少 'regimes' 字段"
+        
+        for tf, regime_result in result['regimes'].items():
+            if 'error' in regime_result:
+                print(f"  ⚠️ {tf} 时间框架: {regime_result['error']}")
+                continue
+            
+            assert 'predictions' in regime_result, f"{tf} 缺少 'predictions'"
+            assert 't+1' in regime_result['predictions'], f"{tf} 缺少 t+1 预测"
+        
+        print("\n✅ predict_multi_timeframe_regimes() 测试通过!")
+        print(f"  - 交易对: {result['symbol']}")
+        print(f"  - 时间框架数量: {len(result['regimes'])}")
         
         return True
         
     except Exception as e:
-        print(f"❌ 获取元数据失败: {e}")
-        logger.exception("获取元数据失败")
+        print(f"\n❌ predict_multi_timeframe_regimes() 测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_get_model_metadata():
+    """测试 get_model_metadata() API"""
+    print("\n" + "="*80)
+    print("测试 4: get_model_metadata() - 模型元数据")
+    print("="*80)
+    
+    try:
+        api = ModelAPI()
+        
+        available = api.list_available_models()
+        if not available:
+            print("❌ 没有可用的模型")
+            return False
+        
+        symbol = available[0]
+        
+        metadata = api.get_model_metadata(symbol, primary_timeframe="15m")
+        
+        assert 'symbol' in metadata, "缺少 'symbol' 字段"
+        assert 'n_states' in metadata, "缺少 'n_states' 字段"
+        assert 'regime_mapping' in metadata, "缺少 'regime_mapping' 字段"
+        assert 'regime_names' in metadata, "缺少 'regime_names' 字段"
+        
+        print("\n✅ get_model_metadata() 测试通过!")
+        print(f"  - 交易对: {metadata['symbol']}")
+        print(f"  - 状态数量: {metadata['n_states']}")
+        print(f"  - 状态映射: {metadata['regime_mapping']}")
+        print(f"  - 状态名称: {metadata['regime_names']}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"\n❌ get_model_metadata() 测试失败: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
 def test_batch_predict():
-    """测试批量预测"""
-    print("\n" + "="*70)
-    print("测试 5: 批量预测多个交易对")
-    print("="*70)
-    
-    api = ModelAPI()
-    available = api.list_available_models()
-    
-    if not available:
-        print("⚠️  没有可用的模型，跳过测试")
-        return False
-    
-    # 只测试前2个交易对（如果有的话）
-    symbols = available[:2]
+    """测试 batch_predict() API"""
+    print("\n" + "="*80)
+    print("测试 5: batch_predict() - 批量预测")
+    print("="*80)
     
     try:
-        results = api.batch_predict(symbols, "15m", 6)
+        api = ModelAPI()
         
-        print(f"\n✓ 批量预测结果:")
+        available = api.list_available_models()
+        if not available:
+            print("❌ 没有可用的模型")
+            return False
+        
+        # 只测试第一个可用的交易对
+        symbols = [available[0]]
+        
+        results = api.batch_predict(
+            symbols=symbols,
+            primary_timeframe="15m"
+        )
+        
+        assert len(results) == len(symbols), "返回结果数量不匹配"
+        
         for symbol, result in results.items():
             if 'error' in result:
-                print(f"  {symbol}: ❌ {result['error']}")
-            else:
-                regime = result['most_likely_regime']
-                print(f"  {symbol}: {regime['name']} (概率: {regime['probability']:.2%})")
+                print(f"  ⚠️ {symbol}: {result['error']}")
+                continue
+            
+            assert 'most_likely_regime' in result, f"{symbol} 缺少 'most_likely_regime'"
+        
+        print("\n✅ batch_predict() 测试通过!")
+        print(f"  - 预测交易对数量: {len(results)}")
         
         return True
         
     except Exception as e:
-        print(f"❌ 批量预测失败: {e}")
-        logger.exception("批量预测失败")
-        return False
-
-
-def test_convenience_functions(symbol: str = None):
-    """测试便捷函数"""
-    print("\n" + "="*70)
-    print("测试 6: 便捷函数")
-    print("="*70)
-    
-    api = ModelAPI()
-    available = api.list_available_models()
-    
-    if not available:
-        print("⚠️  没有可用的模型，跳过测试")
-        return False
-    
-    if symbol is None:
-        symbol = available[0]
-    
-    if symbol not in available:
-        symbol = available[0]
-    
-    try:
-        # 测试便捷函数 predict_regime
-        print(f"\n✓ 测试便捷函数 predict_regime():")
-        result = predict_regime(symbol, "15m")
-        print(f"  最可能状态: {result['most_likely_regime']['name']}")
-        
-        # 测试便捷函数 get_regime_probability
-        print(f"\n✓ 测试便捷函数 get_regime_probability():")
-        prob = get_regime_probability(symbol, "Strong_Trend")
-        print(f"  Strong_Trend 概率: {prob:.2%}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"❌ 便捷函数测试失败: {e}")
-        logger.exception("便捷函数测试失败")
+        print(f"\n❌ batch_predict() 测试失败: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
 def main():
     """运行所有测试"""
-    print("\n" + "="*70)
-    print("Model API 功能测试")
-    print("="*70)
-    
-    # 检查是否有可用的模型
-    api = ModelAPI()
-    available = api.list_available_models()
-    
-    if not available:
-        print("\n⚠️  没有可用的模型！")
-        print("   请先运行训练:")
-        print("   python examples.py 1")
-        print("\n   或者:")
-        print("   python training_pipeline.py")
-        return
-    
-    # 获取第一个可用的交易对
-    test_symbol = available[0]
-    
-    # 运行所有测试
-    tests = [
-        ("列出可用模型", lambda: test_list_models()),
-        ("预测market regime", lambda: test_predict_regime(test_symbol)),
-        ("获取特定状态概率", lambda: test_get_regime_probability(test_symbol)),
-        ("获取模型元数据", lambda: test_get_metadata(test_symbol)),
-        ("批量预测", lambda: test_batch_predict()),
-        ("便捷函数", lambda: test_convenience_functions(test_symbol)),
-    ]
+    print("="*80)
+    print("API 多步预测功能测试")
+    print("="*80)
     
     results = []
-    for test_name, test_func in tests:
-        try:
-            success = test_func()
-            results.append((test_name, success))
-        except Exception as e:
-            print(f"\n❌ {test_name} 测试异常: {e}")
-            logger.exception(f"{test_name} 测试异常")
-            results.append((test_name, False))
     
-    # 打印总结
-    print("\n" + "="*70)
-    print("测试总结")
-    print("="*70)
+    # 运行所有测试
+    results.append(("predict_regimes", test_predict_regimes()))
+    results.append(("predict_next_regime", test_predict_next_regime()))
+    results.append(("predict_multi_timeframe_regimes", test_predict_multi_timeframe_regimes()))
+    results.append(("get_model_metadata", test_get_model_metadata()))
+    results.append(("batch_predict", test_batch_predict()))
     
-    passed = sum(1 for _, success in results if success)
+    # 汇总结果
+    print("\n" + "="*80)
+    print("测试结果汇总")
+    print("="*80)
+    
+    passed = sum(1 for _, result in results if result)
     total = len(results)
     
-    for test_name, success in results:
-        status = "✓ 通过" if success else "❌ 失败"
-        print(f"  {test_name:30s} {status}")
+    for test_name, result in results:
+        status = "✅ 通过" if result else "❌ 失败"
+        print(f"  {test_name}: {status}")
     
     print(f"\n总计: {passed}/{total} 测试通过")
     
     if passed == total:
-        print("\n✅ 所有测试通过！")
+        print("\n🎉 所有 API 测试通过!")
+        return 0
     else:
-        print(f"\n⚠️  有 {total - passed} 个测试失败")
+        print(f"\n⚠️ {total - passed} 个测试失败")
+        return 1
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\n⚠️  测试被用户中断")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n❌ 测试失败: {e}")
-        logger.exception("测试失败")
-        sys.exit(1)
-
+    sys.exit(main())

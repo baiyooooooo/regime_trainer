@@ -114,24 +114,102 @@ class RealtimeRegimePredictor:
         }
         return timeframe_map.get(timeframe, 15)
     
+    def _get_historical_regimes(
+        self, 
+        features: pd.DataFrame, 
+        lookback_bars: int = 16
+    ) -> Dict:
+        """
+        获取历史 regime 序列
+        
+        Args:
+            features: 特征 DataFrame
+            lookback_bars: 回看的 K 线数量（默认 16 根，对于 15m 约为 4 小时）
+            
+        Returns:
+            历史 regime 字典:
+            {
+                'sequence': ['Range', 'Range', 'Weak_Trend', ...],
+                'timestamps': [datetime, datetime, ...],
+                'confidences': [0.72, 0.68, ...],
+                'count': 16,
+                'lookback_hours': 4.0
+            }
+        """
+        sequence_length = self.lstm_classifier.sequence_length
+        
+        # 需要足够的数据来进行滑动窗口预测
+        min_rows_needed = sequence_length + lookback_bars
+        if len(features) < min_rows_needed:
+            logger.warning(
+                f"数据不足以生成历史序列：需要 {min_rows_needed} 行，当前 {len(features)} 行"
+            )
+            return {
+                'sequence': [],
+                'timestamps': [],
+                'confidences': [],
+                'count': 0,
+                'lookback_hours': 0
+            }
+        
+        # 对齐特征
+        feature_names = self.lstm_classifier.feature_names_
+        if feature_names is not None:
+            features = features.reindex(columns=feature_names, fill_value=0)
+        
+        # 标准化
+        features_scaled = self.lstm_classifier.scaler.transform(features)
+        
+        # 滑动窗口预测最近 lookback_bars 个时间点
+        sequence = []
+        timestamps = []
+        confidences = []
+        
+        confidence_threshold = getattr(self.config, 'CONFIDENCE_THRESHOLD', 0.4)
+        
+        # 从最早的开始，保证输出顺序是时间升序
+        start_idx = len(features_scaled) - lookback_bars
+        
+        for i in range(start_idx, len(features_scaled)):
+            X = np.array([features_scaled[i - sequence_length:i]])
+            proba = self.lstm_classifier.predict_proba(X)[0]
+            regime_id = np.argmax(proba)
+            confidence = float(proba[regime_id])
+            
+            is_uncertain = confidence < confidence_threshold
+            regime_name = "Uncertain" if is_uncertain else self._get_regime_name(regime_id)
+            
+            sequence.append(regime_name)
+            timestamps.append(features.index[i])
+            confidences.append(confidence)
+        
+        # 计算回看时间（小时）
+        timeframe_minutes = self._get_timeframe_minutes(self.primary_timeframe)
+        lookback_hours = lookback_bars * timeframe_minutes / 60
+        
+        return {
+            'sequence': sequence,
+            'timestamps': [t.isoformat() if hasattr(t, 'isoformat') else str(t) for t in timestamps],
+            'confidences': confidences,
+            'count': len(sequence),
+            'lookback_hours': lookback_hours
+        }
+    
     def get_current_regime(self) -> Dict:
         """
-        获取当前市场状态
+        获取当前市场状态（支持多步预测）
         
         优化说明：
         - 只获取最新的少量数据（最后几小时），而不是7天
         - 与缓存的特征合并（如果可用）
         - 只重新计算最新数据的特征，避免重复计算
+        - 支持 t+1 到 t+4 的多步预测
         
         Returns:
             包含预测结果的字典
         """
         try:
             # 1. 获取最新数据
-            # 优化：只获取最后几小时的数据，而不是7天
-            # LSTM 只需要 sequence_length (64) 行数据，加上技术指标的窗口期（最大200行）
-            # 所以只需要获取最后约 300 行数据（约2-3天）
-            # 但为了安全，我们获取最近3天的数据
             days = 3
             
             data = self.data_fetcher.fetch_latest_data(
@@ -166,49 +244,86 @@ class RealtimeRegimePredictor:
                     logger.warning(
                         f"特征中 NaN 比例较高 ({nan_percentage:.1f}%)，"
                         f"这可能是因为数据量不足或技术指标窗口期较大。"
-                        f"建议获取更多历史数据（至少 {max(200, self.lstm_classifier.sequence_length * 2)} 行）。"
                     )
             
             # 3. 准备推理数据
             X = self.lstm_classifier.prepare_live_data(features)
             
-            # 4. 预测
-            proba = self.lstm_classifier.predict_proba(X)[0]
-            regime_id = np.argmax(proba)
-            confidence = float(proba[regime_id])
-            
-            # 5. 置信度拒绝机制
+            # 4. 多步预测
             confidence_threshold = getattr(self.config, 'CONFIDENCE_THRESHOLD', 0.4)
+            
+            # 多步模型：返回 t+1 到 t+4 的预测
+            multistep_proba = self.lstm_classifier.predict_multistep(X)
+            
+            # t+1 预测（主要预测）
+            proba_t1 = multistep_proba['t+1'][0]
+            regime_id = np.argmax(proba_t1)
+            confidence = float(proba_t1[regime_id])
+            
+            # 构建多步预测结果
+            predictions = {}
+            for horizon, proba in multistep_proba.items():
+                proba = proba[0]  # 取第一个样本
+                pred_regime_id = np.argmax(proba)
+                pred_confidence = float(proba[pred_regime_id])
+                is_uncertain = pred_confidence < confidence_threshold
+                
+                predictions[horizon] = {
+                    'regime_id': int(pred_regime_id),
+                    'regime_name': "Uncertain" if is_uncertain else self._get_regime_name(pred_regime_id),
+                    'confidence': pred_confidence,
+                    'is_uncertain': is_uncertain,
+                    'probabilities': {
+                        self._get_regime_name(i): float(p)
+                        for i, p in enumerate(proba)
+                    }
+                }
+            
+            # 5. 置信度拒绝机制（针对 t+1）
             is_uncertain = confidence < confidence_threshold
             
             if is_uncertain:
                 regime_name = "Uncertain"
                 logger.warning(
-                    f"{self.symbol} 置信度过低 ({confidence:.2%} < {confidence_threshold:.0%})，"
+                    f"{self.symbol} t+1 置信度过低 ({confidence:.2%} < {confidence_threshold:.0%})，"
                     f"标记为 Uncertain（原判断: {self._get_regime_name(regime_id)}）"
                 )
             else:
                 regime_name = self._get_regime_name(regime_id)
             
-            # 6. 返回结果
+            # 6. 获取历史 regime 序列
+            history_lookback_bars = getattr(self.config, 'HISTORY_LOOKBACK_BARS', 16)
+            historical_regimes = self._get_historical_regimes(features, lookback_bars=history_lookback_bars)
+            
+            # 7. 返回结果
             result = {
                 'symbol': self.symbol,
-                'primary_timeframe': self.primary_timeframe,  # 新增：主时间框架
+                'primary_timeframe': self.primary_timeframe,
                 'timestamp': datetime.now(),
+                # 主预测（t+1，向后兼容）
                 'regime_id': int(regime_id),
                 'regime_name': regime_name,
                 'confidence': confidence,
                 'is_uncertain': is_uncertain,
                 'confidence_threshold': confidence_threshold,
-                'original_regime': self._get_regime_name(regime_id),  # 保留原始判断供参考
-                'probabilities': {
-                    self._get_regime_name(i): float(p)
-                    for i, p in enumerate(proba)
-                }
+                'original_regime': self._get_regime_name(regime_id),
+                'probabilities': predictions['t+1']['probabilities'],
+                # 多步预测
+                'is_multistep': True,
+                'predictions': predictions,
+                # 历史 regime 序列
+                'historical_regimes': historical_regimes,
             }
             
             if not is_uncertain:
                 logger.info(f"{self.symbol} 当前状态: {regime_name} (置信度: {confidence:.2%})")
+                for h in ['t+2', 't+3', 't+4']:
+                    if h in predictions:
+                        pred = predictions[h]
+                        logger.debug(
+                            f"  {h}: {pred['regime_name']} (置信度: {pred['confidence']:.2%})"
+                        )
+            
             return result
             
         except Exception as e:

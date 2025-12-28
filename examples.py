@@ -1,6 +1,7 @@
 """
 快速开始示例脚本
 支持 5m 和 15m 两种时间框架的训练和预测
+支持多步预测 (t+1 到 t+4)
 """
 import sys
 import logging
@@ -14,6 +15,16 @@ logger = logging.getLogger(__name__)
 
 # 默认时间框架
 DEFAULT_TIMEFRAME = "15m"
+
+
+def _print_multistep_results(result: dict):
+    """打印多步预测训练结果的辅助函数"""
+    print(f"\n📊 多步预测信息:")
+    print(f"  预测步数: {result.get('prediction_horizons', [1, 2, 3, 4])}")
+    
+    # 显示各步的损失权重
+    from config import TrainingConfig
+    print(f"  损失权重: {TrainingConfig.HORIZON_LOSS_WEIGHTS}")
 
 def example_1_single_symbol_training():
     """示例 1: 训练单个交易对"""
@@ -37,10 +48,13 @@ def example_1_single_symbol_training():
         result = pipeline.full_retrain("BTCUSDT")
         
         print(f"\n✅ 训练完成！")
-        print(f"测试集准确率: {result['test_accuracy']:.2%}")
+        print(f"测试集准确率 (t+1): {result['test_accuracy']:.2%}")
         print(f"测试集损失: {result['test_loss']:.4f}")
         if 'val_accuracy' in result:
-            print(f"验证集准确率: {result['val_accuracy']:.2%}")
+            print(f"验证集准确率 (t+1): {result['val_accuracy']:.2%}")
+        
+        # 显示多步预测信息
+        _print_multistep_results(result)
         
         # 显示动态状态数量优化结果
         if result.get('n_states_optimization'):
@@ -127,25 +141,36 @@ def example_2_multiple_symbols_training():
 
 
 def example_3_realtime_prediction():
-    """示例 3: 实时市场状态预测"""
+    """示例 3: 实时市场状态预测（支持多步预测 t+1 到 t+4）"""
     print("\n" + "="*80)
-    print("示例 3: 实时市场状态预测")
+    print("示例 3: 实时市场状态预测（多步预测）")
     print("="*80 + "\n")
     
     try:
         # 创建预测器
         predictor = RealtimeRegimePredictor("BTCUSDT", TrainingConfig)
         
-        # 获取当前市场状态
+        # 获取当前市场状态（包括多步预测）
         current = predictor.get_current_regime()
         
-        print(f"\n{current['symbol']} 当前市场状态:")
+        print(f"\n{current['symbol']} 当前市场状态 ({current['primary_timeframe']}):")
         print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        print(f"状态: {current['regime_name']}")
-        print(f"置信度: {current['confidence']:.2%}")
         print(f"时间: {current['timestamp']}")
         
-        print(f"\n所有状态概率分布:")
+        # 显示多步预测结果
+        predictions = current.get('predictions', {})
+        if predictions:
+            print(f"\n📈 多步预测结果:")
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            for horizon in ['t+1', 't+2', 't+3', 't+4']:
+                if horizon in predictions:
+                    pred = predictions[horizon]
+                    bar = "█" * int(pred['confidence'] * 30)
+                    uncertain_mark = " ⚠️" if pred.get('is_uncertain', False) else ""
+                    print(f"  {horizon}: {pred['regime_name']:20s} {pred['confidence']:6.2%} {bar}{uncertain_mark}")
+        
+        # 显示 t+1 的详细概率分布
+        print(f"\nt+1 状态概率分布详情:")
         print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         for regime, prob in sorted(
             current['probabilities'].items(), 
@@ -153,7 +178,22 @@ def example_3_realtime_prediction():
             reverse=True
         ):
             bar = "█" * int(prob * 50)
-            print(f"{regime:20s} {prob:6.2%} {bar}")
+            print(f"  {regime:20s} {prob:6.2%} {bar}")
+        
+        # 显示历史 regime 序列
+        historical = current.get('historical_regimes', {})
+        if historical and historical.get('sequence'):
+            print(f"\n📜 历史 Regime 序列 (过去 {historical.get('lookback_hours', 4)} 小时):")
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            seq = historical['sequence']
+            # 只显示最近 8 个
+            recent = seq[-8:] if len(seq) > 8 else seq
+            print(f"  最近 {len(recent)} 根 K 线: {' -> '.join(recent)}")
+            
+            # 统计历史分布
+            from collections import Counter
+            counts = Counter(seq)
+            print(f"  分布统计: {dict(counts)}")
         
     except FileNotFoundError:
         print("\n❌ 模型文件不存在，请先运行训练（示例 1 或 2）")
@@ -291,10 +331,13 @@ def example_7_5m_single_symbol_training():
         result = pipeline.full_retrain("BTCUSDT", primary_timeframe="5m")
         
         print(f"\n✅ 5m 模型训练完成！")
-        print(f"测试集准确率: {result['test_accuracy']:.2%}")
+        print(f"测试集准确率 (t+1): {result['test_accuracy']:.2%}")
         print(f"测试集损失: {result['test_loss']:.4f}")
         if 'val_accuracy' in result:
-            print(f"验证集准确率: {result['val_accuracy']:.2%}")
+            print(f"验证集准确率 (t+1): {result['val_accuracy']:.2%}")
+        
+        # 显示多步预测信息
+        _print_multistep_results(result)
         
         # 显示动态状态数量优化结果
         if result.get('n_states_optimization'):
@@ -317,25 +360,37 @@ def example_7_5m_single_symbol_training():
 
 
 def example_8_5m_realtime_prediction():
-    """示例 8: 5m 实时市场状态预测"""
+    """示例 8: 5m 实时市场状态预测（支持多步预测）"""
     print("\n" + "="*80)
-    print("示例 8: 5m 实时市场状态预测")
+    print("示例 8: 5m 实时市场状态预测（多步预测）")
     print("="*80 + "\n")
     
     try:
         # 创建 5m 预测器
         predictor = RealtimeRegimePredictor("BTCUSDT", TrainingConfig, primary_timeframe="5m")
         
-        # 获取当前市场状态
+        # 获取当前市场状态（包括多步预测）
         current = predictor.get_current_regime()
         
         print(f"\n{current['symbol']} 当前市场状态 (5m 时间框架):")
         print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        print(f"状态: {current['regime_name']}")
-        print(f"置信度: {current['confidence']:.2%}")
         print(f"时间: {current['timestamp']}")
         
-        print(f"\n所有状态概率分布:")
+        # 显示多步预测结果
+        predictions = current.get('predictions', {})
+        if predictions:
+            print(f"\n📈 多步预测结果 (5m):")
+            print(f"  (每步代表 5 分钟，t+4 = 20 分钟后)")
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            for horizon in ['t+1', 't+2', 't+3', 't+4']:
+                if horizon in predictions:
+                    pred = predictions[horizon]
+                    bar = "█" * int(pred['confidence'] * 30)
+                    uncertain_mark = " ⚠️" if pred.get('is_uncertain', False) else ""
+                    print(f"  {horizon}: {pred['regime_name']:20s} {pred['confidence']:6.2%} {bar}{uncertain_mark}")
+        
+        # 显示 t+1 的详细概率分布
+        print(f"\nt+1 状态概率分布详情:")
         print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         for regime, prob in sorted(
             current['probabilities'].items(), 
@@ -343,7 +398,16 @@ def example_8_5m_realtime_prediction():
             reverse=True
         ):
             bar = "█" * int(prob * 50)
-            print(f"{regime:20s} {prob:6.2%} {bar}")
+            print(f"  {regime:20s} {prob:6.2%} {bar}")
+        
+        # 显示历史 regime 序列
+        historical = current.get('historical_regimes', {})
+        if historical and historical.get('sequence'):
+            print(f"\n📜 历史 Regime 序列 (过去 {historical.get('lookback_hours', 4)} 小时):")
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            seq = historical['sequence']
+            recent = seq[-8:] if len(seq) > 8 else seq
+            print(f"  最近 {len(recent)} 根 K 线: {' -> '.join(recent)}")
         
     except FileNotFoundError:
         print("\n❌ 5m 模型文件不存在，请先运行 5m 训练（示例 7）")
@@ -430,34 +494,38 @@ def example_11_multi_timeframe_prediction():
         print(f"\nBTCUSDT 多时间框架市场状态:")
         print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         
-        for tf, result in results.items():
+        regimes = results.get('regimes', {})
+        for tf, result in regimes.items():
             if 'error' in result:
                 print(f"\n{tf} 时间框架: ❌ {result['error']}")
             else:
                 print(f"\n{tf} 时间框架:")
-                print(f"  状态: {result['regime_name']}")
-                print(f"  置信度: {result['confidence']:.2%}")
-                print(f"  概率分布:")
-                for regime, prob in sorted(
-                    result['probabilities'].items(), 
-                    key=lambda x: x[1], 
-                    reverse=True
-                )[:3]:  # 只显示前3个
-                    bar = "█" * int(prob * 30)
-                    print(f"    {regime:20s} {prob:6.2%} {bar}")
+                # 获取 t+1 预测
+                t1_pred = result.get('predictions', {}).get('t+1', {})
+                if t1_pred:
+                    print(f"  t+1 状态: {t1_pred['most_likely']}")
+                    print(f"  t+1 置信度: {t1_pred['confidence']:.2%}")
+                    print(f"  概率分布:")
+                    for regime, prob in sorted(
+                        t1_pred['probabilities'].items(), 
+                        key=lambda x: x[1], 
+                        reverse=True
+                    )[:3]:  # 只显示前3个
+                        bar = "█" * int(prob * 30)
+                        print(f"    {regime:20s} {prob:6.2%} {bar}")
         
         # 比较两个时间框架的状态
-        if '5m' in results and '15m' in results:
-            if 'error' not in results['5m'] and 'error' not in results['15m']:
-                r5m = results['5m']['regime_name']
-                r15m = results['15m']['regime_name']
+        if '5m' in regimes and '15m' in regimes:
+            if 'error' not in regimes['5m'] and 'error' not in regimes['15m']:
+                r5m_t1 = regimes['5m'].get('predictions', {}).get('t+1', {}).get('most_likely', 'N/A')
+                r15m_t1 = regimes['15m'].get('predictions', {}).get('t+1', {}).get('most_likely', 'N/A')
                 
-                print(f"\n📊 时间框架对比:")
+                print(f"\n📊 时间框架对比 (t+1):")
                 print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                if r5m == r15m:
-                    print(f"✓ 5m 和 15m 状态一致: {r5m}")
+                if r5m_t1 == r15m_t1:
+                    print(f"✓ 5m 和 15m 的 t+1 状态一致: {r5m_t1}")
                 else:
-                    print(f"⚠️ 5m ({r5m}) 和 15m ({r15m}) 状态不一致")
+                    print(f"⚠️ 5m ({r5m_t1}) 和 15m ({r15m_t1}) 的 t+1 状态不一致")
                     print(f"   这可能表示市场正在发生短期变化")
         
     except Exception as e:
@@ -527,10 +595,199 @@ def example_13_batch_5m_training():
                 print(f"  🔄 状态数量调整: {opt['original_n_states']} -> {opt['optimal_n_states']}")
 
 
+# ============================================================================
+# 多步预测 API 测试示例
+# ============================================================================
+
+def example_14_multistep_api_15m():
+    """示例 14: 使用 API 进行 15m 多步预测"""
+    print("\n" + "="*80)
+    print("示例 14: 使用 predict_regimes() API 进行 15m 多步预测")
+    print("="*80 + "\n")
+    
+    try:
+        api = ModelAPI()
+        
+        # 使用新的 predict_regimes API
+        result = api.predict_regimes(
+            symbol="BTCUSDT",
+            primary_timeframe="15m",
+            include_history=True,
+            history_bars=16  # 16 根 15m K 线 = 4 小时
+        )
+        
+        print(f"\n{result['symbol']} 多步预测结果 ({result['timeframe']}):")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"时间: {result['timestamp']}")
+        # 现在总是多步预测
+        
+        # 模型信息
+        model_info = result.get('model_info', {})
+        print(f"\n📊 模型信息:")
+        print(f"  序列长度: {model_info.get('sequence_length', 'N/A')}")
+        print(f"  状态数量: {model_info.get('n_states', 'N/A')}")
+        print(f"  预测步数: {model_info.get('prediction_horizons', 'N/A')}")
+        
+        # 多步预测
+        predictions = result.get('predictions', {})
+        if predictions:
+            print(f"\n📈 多步预测 (15m):")
+            print(f"  (每步代表 15 分钟，t+4 = 1 小时后)")
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            for horizon in ['t+1', 't+2', 't+3', 't+4']:
+                if horizon in predictions:
+                    pred = predictions[horizon]
+                    bar = "█" * int(pred['confidence'] * 30)
+                    uncertain_mark = " ⚠️" if pred.get('is_uncertain', False) else ""
+                    print(f"  {horizon}: {pred['most_likely']:20s} {pred['confidence']:6.2%} {bar}{uncertain_mark}")
+        
+        # 历史序列
+        historical = result.get('historical_regimes', {})
+        if historical and historical.get('sequence'):
+            print(f"\n📜 历史 Regime 序列 (过去 {historical.get('lookback_hours', 4):.1f} 小时):")
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            seq = historical['sequence']
+            recent = seq[-8:] if len(seq) > 8 else seq
+            print(f"  最近 {len(recent)} 根 K 线: {' -> '.join(recent)}")
+            
+            # 统计
+            from collections import Counter
+            counts = Counter(seq)
+            print(f"  历史分布: {dict(counts)}")
+        
+    except FileNotFoundError:
+        print("\n❌ 15m 模型文件不存在，请先运行训练（示例 1）")
+    except Exception as e:
+        print(f"\n❌ 错误: {e}")
+
+
+def example_15_multistep_api_5m():
+    """示例 15: 使用 API 进行 5m 多步预测"""
+    print("\n" + "="*80)
+    print("示例 15: 使用 predict_regimes() API 进行 5m 多步预测")
+    print("="*80 + "\n")
+    
+    try:
+        api = ModelAPI()
+        
+        # 使用新的 predict_regimes API
+        result = api.predict_regimes(
+            symbol="BTCUSDT",
+            primary_timeframe="5m",
+            include_history=True,
+            history_bars=24  # 24 根 5m K 线 = 2 小时
+        )
+        
+        print(f"\n{result['symbol']} 多步预测结果 ({result['timeframe']}):")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"时间: {result['timestamp']}")
+        # 现在总是多步预测
+        
+        # 模型信息
+        model_info = result.get('model_info', {})
+        print(f"\n📊 模型信息:")
+        print(f"  序列长度: {model_info.get('sequence_length', 'N/A')}")
+        print(f"  状态数量: {model_info.get('n_states', 'N/A')}")
+        print(f"  预测步数: {model_info.get('prediction_horizons', 'N/A')}")
+        
+        # 多步预测
+        predictions = result.get('predictions', {})
+        if predictions:
+            print(f"\n📈 多步预测 (5m):")
+            print(f"  (每步代表 5 分钟，t+4 = 20 分钟后)")
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            for horizon in ['t+1', 't+2', 't+3', 't+4']:
+                if horizon in predictions:
+                    pred = predictions[horizon]
+                    bar = "█" * int(pred['confidence'] * 30)
+                    uncertain_mark = " ⚠️" if pred.get('is_uncertain', False) else ""
+                    print(f"  {horizon}: {pred['most_likely']:20s} {pred['confidence']:6.2%} {bar}{uncertain_mark}")
+        
+        # 历史序列
+        historical = result.get('historical_regimes', {})
+        if historical and historical.get('sequence'):
+            print(f"\n📜 历史 Regime 序列 (过去 {historical.get('lookback_hours', 2):.1f} 小时):")
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            seq = historical['sequence']
+            recent = seq[-8:] if len(seq) > 8 else seq
+            print(f"  最近 {len(recent)} 根 K 线: {' -> '.join(recent)}")
+        
+    except FileNotFoundError:
+        print("\n❌ 5m 模型文件不存在，请先运行 5m 训练（示例 7）")
+    except Exception as e:
+        print(f"\n❌ 错误: {e}")
+
+
+def example_16_compare_timeframes():
+    """示例 16: 对比 5m 和 15m 的多步预测"""
+    print("\n" + "="*80)
+    print("示例 16: 对比 5m 和 15m 的多步预测")
+    print("="*80 + "\n")
+    
+    try:
+        api = ModelAPI()
+        
+        # 获取两个时间框架的预测
+        results = {}
+        for tf in ['5m', '15m']:
+            try:
+                results[tf] = api.predict_regimes(
+                    symbol="BTCUSDT",
+                    primary_timeframe=tf,
+                    include_history=True
+                )
+            except FileNotFoundError:
+                results[tf] = {'error': f'{tf} 模型不存在'}
+        
+        print(f"\nBTCUSDT 多时间框架多步预测对比:")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        
+        # 并排显示
+        print(f"\n{'Horizon':<10} {'5m 预测':^25} {'15m 预测':^25}")
+        print("-" * 60)
+        
+        for horizon in ['t+1', 't+2', 't+3', 't+4']:
+            row_5m = "N/A"
+            row_15m = "N/A"
+            
+            if 'error' not in results.get('5m', {}):
+                pred = results['5m'].get('predictions', {}).get(horizon, {})
+                if pred:
+                    row_5m = f"{pred['most_likely'][:15]:15s} ({pred['confidence']:.0%})"
+            
+            if 'error' not in results.get('15m', {}):
+                pred = results['15m'].get('predictions', {}).get(horizon, {})
+                if pred:
+                    row_15m = f"{pred['most_likely'][:15]:15s} ({pred['confidence']:.0%})"
+            
+            print(f"{horizon:<10} {row_5m:^25} {row_15m:^25}")
+        
+        # 时间对应关系
+        print(f"\n⏱️ 时间对应关系:")
+        print(f"  5m:  t+1=5分钟, t+2=10分钟, t+3=15分钟, t+4=20分钟")
+        print(f"  15m: t+1=15分钟, t+2=30分钟, t+3=45分钟, t+4=60分钟")
+        
+        # 一致性分析
+        if 'error' not in results.get('5m', {}) and 'error' not in results.get('15m', {}):
+            pred_5m_t1 = results['5m'].get('predictions', {}).get('t+1', {}).get('most_likely')
+            pred_15m_t1 = results['15m'].get('predictions', {}).get('t+1', {}).get('most_likely')
+            
+            print(f"\n📊 t+1 一致性分析:")
+            if pred_5m_t1 == pred_15m_t1:
+                print(f"  ✓ 5m 和 15m 的 t+1 预测一致: {pred_5m_t1}")
+            else:
+                print(f"  ⚠️ 5m ({pred_5m_t1}) 和 15m ({pred_15m_t1}) 的 t+1 预测不一致")
+                print(f"     这可能表示市场正在发生短期变化")
+        
+    except Exception as e:
+        print(f"\n❌ 错误: {e}")
+
+
 def print_menu():
     """打印菜单"""
     print("\n" + "="*80)
     print("加密货币市场状态分类器 - 示例脚本")
+    print("支持多步预测 (t+1 到 t+4)")
     print("="*80)
     print("\n选择要运行的示例：")
     
@@ -538,30 +795,33 @@ def print_menu():
     print("📊 15m 时间框架 (默认)")
     print("-"*40)
     print("  训练相关:")
-    print("    1. 训练单个交易对 (BTCUSDT)")
+    print("    1. 训练单个交易对 (BTCUSDT) [多步预测]")
     print("    2. 批量训练多个交易对")
     print("    6. 增量训练")
     print("  推理相关:")
-    print("    3. 实时市场状态预测")
+    print("    3. 实时市场状态预测 [多步预测 t+1~t+4]")
     print("    4. 查看历史市场状态变化")
     print("    5. 多交易对市场状态跟踪")
+    print("   14. 🆕 使用 predict_regimes() API 多步预测")
     
     print("\n" + "-"*40)
     print("⚡ 5m 时间框架 (快速决策)")
     print("-"*40)
     print("  训练相关:")
-    print("    7. 训练单个交易对 5m 模型 (BTCUSDT)")
+    print("    7. 训练单个交易对 5m 模型 [多步预测]")
     print("   13. 批量训练多个交易对 5m 模型")
     print("    9. 5m 增量训练")
     print("  推理相关:")
-    print("    8. 5m 实时市场状态预测")
+    print("    8. 5m 实时市场状态预测 [多步预测 t+1~t+4]")
     print("   10. 5m 历史市场状态变化")
     print("   12. 5m 多交易对市场状态跟踪")
+    print("   15. 🆕 使用 predict_regimes() API 5m 多步预测")
     
     print("\n" + "-"*40)
     print("🔄 多时间框架")
     print("-"*40)
     print("   11. 多时间框架并行预测 (5m + 15m)")
+    print("   16. 🆕 对比 5m 和 15m 的多步预测")
     
     print("\n" + "-"*40)
     print("其他:")
@@ -591,6 +851,10 @@ def main():
         11: example_11_multi_timeframe_prediction,
         12: example_12_5m_multi_symbol_tracking,
         13: example_13_batch_5m_training,
+        # 多步预测 API 测试
+        14: example_14_multistep_api_15m,
+        15: example_15_multistep_api_5m,
+        16: example_16_compare_timeframes,
     }
     
     # 如果有命令行参数，直接运行指定示例

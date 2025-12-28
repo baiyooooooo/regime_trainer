@@ -31,8 +31,8 @@ class TrainingConfig:
             "primary_timeframe": "5m",
             "timeframes": ["1m", "5m", "15m"],  # 包含 1m 用于捕捉微观结构
             "sequence_length": 48,  # 48根5m K线 = 4小时
-            "lstm_units": [64, 32],
-            "dense_units": [32],
+            "lstm_units": [96, 48],  # 增加容量以匹配更长的序列（48 vs 32）
+            "dense_units": [48],  # 相应增加 Dense 层容量
         },
         "15m": {
             "primary_timeframe": "15m",
@@ -136,6 +136,27 @@ class TrainingConfig:
     DROPOUT_RATE = 0.25  # Dropout比率（降低正则化，给模型更多学习空间）
     EPOCHS = 50
     BATCH_SIZE = 32
+    
+    # ============ 多步预测配置 ============
+    # 预测未来多根 K 线的 market regime
+    PREDICTION_HORIZONS = [1, 2, 3, 4]  # 预测 t+1 到 t+4
+    
+    # 软标签温度（>1 使分布更平滑，用于 t+2 及以后的标签生成）
+    # 较高的温度会产生更 "软" 的标签，有助于处理长期预测的不确定性
+    LABEL_TEMPERATURE = 1.5
+    
+    # 历史回看的 K 线数量（用于输出历史 regime 序列）
+    # 16 根 15m K 线 = 4 小时
+    HISTORY_LOOKBACK_BARS = 16
+    
+    # 各预测步数的损失权重
+    # 远期预测的权重较低，因为不确定性更大
+    HORIZON_LOSS_WEIGHTS = {
+        't+1': 1.0,   # 主预测，权重最高
+        't+2': 0.8,
+        't+3': 0.6,
+        't+4': 0.4,
+    }
     
     # ============ 数据划分配置（避免数据泄漏） ============
     # 使用 train/val/test 三分（而不是旧的 train/test 二分）

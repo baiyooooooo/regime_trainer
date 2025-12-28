@@ -225,6 +225,31 @@ class TrainingPipeline:
             test_features=test_features
         )
         
+        # ========== 多步预测标签生成 ==========
+        # 使用 forward-only filtering（无 look-ahead bias）
+        prediction_horizons = getattr(self.config, 'PREDICTION_HORIZONS', [1, 2, 3, 4])
+        label_temperature = getattr(self.config, 'LABEL_TEMPERATURE', 1.5)
+        
+        logger.info(f"生成多步预测标签: horizons={prediction_horizons}, temperature={label_temperature}")
+        
+        # Forward filter 生成滤波后验概率
+        train_posteriors = hmm_labeler.forward_filter(train_features)
+        val_posteriors = hmm_labeler.forward_filter(val_features)
+        test_posteriors = hmm_labeler.forward_filter(test_features) if test_features is not None else None
+        
+        # 生成多步标签
+        train_multistep_labels = hmm_labeler.generate_multistep_labels(
+            train_posteriors, horizons=prediction_horizons, temperature=label_temperature
+        )
+        val_multistep_labels = hmm_labeler.generate_multistep_labels(
+            val_posteriors, horizons=prediction_horizons, temperature=label_temperature
+        )
+        test_multistep_labels = None
+        if test_posteriors is not None:
+            test_multistep_labels = hmm_labeler.generate_multistep_labels(
+                test_posteriors, horizons=prediction_horizons, temperature=label_temperature
+            )
+        
         # 自动映射 HMM 状态到语义名称（关键步骤！）
         # 使用配置中的绝对阈值护栏参数
         regime_mapping = hmm_labeler.auto_map_regimes(
@@ -338,36 +363,44 @@ class TrainingPipeline:
         logger.info(f"\n训练集市场状态分析:\n{regime_analysis}")
         
         # 5. 准备 LSTM 训练数据
-        logger.info("步骤 5/6: 准备 LSTM 训练数据...")
+        logger.info("步骤 5/6: 准备 LSTM 多步预测训练数据...")
+        
+        # 获取损失权重配置
+        horizon_loss_weights = getattr(self.config, 'HORIZON_LOSS_WEIGHTS', {
+            't+1': 1.0, 't+2': 0.8, 't+3': 0.6, 't+4': 0.4
+        })
+        
         lstm_classifier = LSTMRegimeClassifier(
-            n_states=self.config.N_STATES,
+            n_states=hmm_labeler.n_states,  # 使用 HMM 的实际状态数量（可能被动态调整）
             sequence_length=sequence_length,  # 使用模型配置的序列长度
             lstm_units=lstm_units,  # 使用模型配置的 LSTM 单元数
             dense_units=dense_units,  # 使用模型配置的 Dense 单元数
             dropout_rate=self.config.DROPOUT_RATE,
             l2_lambda=self.config.L2_LAMBDA,
             use_batch_norm=self.config.USE_BATCH_NORM,
-            learning_rate=self.config.LEARNING_RATE
+            learning_rate=self.config.LEARNING_RATE,
+            prediction_horizons=prediction_horizons,
+            horizon_loss_weights=horizon_loss_weights
         )
         
-        # 使用新方法：支持 train/val/test 三分
-        X_train, y_train, X_val, y_val, X_test, y_test = lstm_classifier.prepare_data_split(
+        # 使用多步数据准备方法
+        X_train, y_train_dict, X_val, y_val_dict, X_test, y_test_dict = lstm_classifier.prepare_multistep_data_split(
             train_features=train_features,
-            train_labels=train_states,
+            train_labels=train_multistep_labels,
             val_features=val_features,
-            val_labels=val_states,
+            val_labels=val_multistep_labels,
             test_features=test_features,
-            test_labels=test_states
+            test_labels=test_multistep_labels
         )
         
         # 6. 训练 LSTM
-        logger.info("步骤 6/6: 训练 LSTM 模型...")
+        logger.info("步骤 6/6: 训练 LSTM 多步预测模型...")
         model_path = self.config.get_model_path(symbol, "lstm", primary_timeframe)
         
-        # 使用验证集进行早停和模型选择
-        history = lstm_classifier.train(
-            X_train, y_train,
-            X_val, y_val,  # 验证集用于早停
+        # 使用多步训练方法
+        history = lstm_classifier.train_multistep(
+            X_train, y_train_dict,
+            X_val, y_val_dict,  # 验证集用于早停
             epochs=self.config.EPOCHS,
             batch_size=self.config.BATCH_SIZE,
             early_stopping_patience=self.config.EARLY_STOPPING_PATIENCE,
@@ -377,18 +410,46 @@ class TrainingPipeline:
         )
         
         # 在独立测试集上评估模型（这才是真实的泛化性能）
-        logger.info("在独立测试集上评估模型...")
-        if X_test is not None and y_test is not None:
-            eval_results = lstm_classifier.evaluate(X_test, y_test)
-            logger.info(f"🎯 测试集准确率: {eval_results['accuracy']:.4f} (这是真实的泛化性能)")
+        logger.info("在独立测试集上评估多步预测模型...")
+        eval_results = {}
+        val_eval = {}
+        
+        if X_test is not None and y_test_dict is not None:
+            # 评估 t+1 预测（主要指标）
+            y_test_t1 = y_test_dict['t+1']
+            y_pred_t1 = lstm_classifier.predict(X_test)
+            from sklearn.metrics import accuracy_score
+            test_acc_t1 = accuracy_score(y_test_t1, y_pred_t1)
+            eval_results['accuracy'] = test_acc_t1
+            eval_results['loss'] = 0.0  # 需要从模型获取
+            logger.info(f"🎯 测试集 t+1 准确率: {test_acc_t1:.4f} (这是真实的泛化性能)")
+            
+            # 评估其他 horizon（如果存在）
+            multistep_predictions = lstm_classifier.predict_multistep(X_test)
+            for h in prediction_horizons:
+                if h > 1:
+                    # 对于软标签，比较 argmax
+                    y_true_h = np.argmax(y_test_dict[f't+{h}'], axis=1)
+                    y_pred_h = np.argmax(multistep_predictions[f't+{h}'], axis=1)
+                    acc_h = accuracy_score(y_true_h, y_pred_h)
+                    logger.info(f"    测试集 t+{h} 准确率: {acc_h:.4f}")
         else:
-            # 如果没有测试集，使用验证集评估（不推荐）
-            eval_results = lstm_classifier.evaluate(X_val, y_val)
+            # 使用验证集评估
+            y_val_t1 = y_val_dict['t+1']
+            y_pred_val_t1 = lstm_classifier.predict(X_val)
+            from sklearn.metrics import accuracy_score
+            val_acc_t1 = accuracy_score(y_val_t1, y_pred_val_t1)
+            eval_results['accuracy'] = val_acc_t1
+            eval_results['loss'] = 0.0
             logger.warning("⚠️ 没有独立测试集，使用验证集评估（结果可能偏乐观）")
         
-        # 同时输出验证集准确率作为参考
-        val_eval = lstm_classifier.evaluate(X_val, y_val)
-        logger.info(f"验证集准确率: {val_eval['accuracy']:.4f}")
+        # 验证集准确率作为参考
+        y_val_t1 = y_val_dict['t+1']
+        y_pred_val = lstm_classifier.predict(X_val)
+        from sklearn.metrics import accuracy_score
+        val_acc = accuracy_score(y_val_t1, y_pred_val)
+        val_eval['accuracy'] = val_acc
+        logger.info(f"验证集 t+1 准确率: {val_acc:.4f}")
         
         # 保存模型和标准化器
         scaler_path = self.config.get_scaler_path(symbol, primary_timeframe)
@@ -399,12 +460,12 @@ class TrainingPipeline:
         
         return {
             'symbol': symbol,
-            'primary_timeframe': primary_timeframe,  # 新增：主时间框架
+            'primary_timeframe': primary_timeframe,  # 主时间框架
             'training_type': 'full_retrain',
             'timestamp': datetime.now(),
             'test_accuracy': eval_results['accuracy'],
             'val_accuracy': val_eval['accuracy'],
-            'test_loss': eval_results['loss'],
+            'test_loss': eval_results.get('loss', 0.0),
             'regime_analysis': regime_analysis,
             'regime_mapping': regime_mapping,  # HMM 状态到语义名称的映射
             'mapping_comparison': mapping_comparison,  # 新旧映射比对结果
@@ -415,7 +476,9 @@ class TrainingPipeline:
             'bic_validation': bic_validation,  # BIC 状态数量验证结果
             'n_states_optimization': n_states_optimization,  # 动态状态数量优化结果
             'final_n_states': hmm_labeler.n_states,  # 最终使用的状态数量
-            'sequence_length': sequence_length,  # 新增：序列长度
+            'sequence_length': sequence_length,  # 序列长度
+            'prediction_horizons': prediction_horizons,  # 多步预测步数
+            'is_multistep': lstm_classifier.is_multistep,  # 是否多步模型
             'history': history,
             'data_split': {
                 'train_samples': len(train_features),

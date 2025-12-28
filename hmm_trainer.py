@@ -8,12 +8,17 @@ HMM 训练模块 - 用于无监督市场状态标注
 自动映射功能：
 - auto_map_regimes() 根据特征统计自动将 HMM 状态映射到语义名称
 - 解决了 HMM 状态编号任意性的问题
+
+多步预测标签生成：
+- forward_filter() 使用 forward-only 算法（无 look-ahead）
+- generate_multistep_labels() 使用转移矩阵传播生成 t+1 到 t+4 的标签
 """
 import numpy as np
 import pandas as pd
 from hmmlearn import hmm
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+from scipy.special import logsumexp
 import pickle
 import logging
 from typing import Tuple, Optional, Dict, List
@@ -212,6 +217,9 @@ class HMMRegimeLabeler:
         """
         预测市场状态的概率分布
         
+        注意：此方法使用 forward-backward 算法，会有 look-ahead bias。
+        对于训练标签生成，建议使用 forward_filter() 方法。
+        
         Args:
             features: 特征 DataFrame
             
@@ -228,6 +236,133 @@ class HMMRegimeLabeler:
         log_prob, posteriors = self.hmm_model.score_samples(features_pca)
         
         return posteriors
+    
+    def forward_filter(self, features: pd.DataFrame) -> np.ndarray:
+        """
+        使用 Forward-only 算法计算滤波后验概率 P(state_t | obs_1:t)
+        
+        与 predict_proba() 不同，此方法不使用 backward pass，因此没有 look-ahead bias。
+        这是生成训练标签的推荐方法。
+        
+        Args:
+            features: 特征 DataFrame
+            
+        Returns:
+            滤波后验概率矩阵 (n_samples, n_states)
+        """
+        if self.hmm_model is None:
+            raise ValueError("模型尚未训练，请先调用 fit()")
+        
+        # 确保特征列与训练时一致
+        if self.feature_names_ is not None:
+            missing_features = set(self.feature_names_) - set(features.columns)
+            if missing_features:
+                logger.warning(
+                    f"缺少 {len(missing_features)} 个训练时使用的特征，将填充为0"
+                )
+                for feat in missing_features:
+                    features = features.copy()
+                    features[feat] = 0.0
+            features = features[self.feature_names_]
+        
+        # 预处理
+        features_scaled = self.scaler.transform(features)
+        features_pca = self.pca.transform(features_scaled)
+        
+        n_samples = len(features_pca)
+        n_states = self.n_states
+        
+        # 计算 log 发射概率
+        log_emission = self.hmm_model._compute_log_likelihood(features_pca)
+        
+        # 初始化 forward 变量
+        log_alpha = np.zeros((n_samples, n_states))
+        log_startprob = np.log(self.hmm_model.startprob_ + 1e-10)
+        log_transmat = np.log(self.hmm_model.transmat_ + 1e-10)
+        
+        # t=0: alpha_0(j) = pi_j * b_j(o_0)
+        log_alpha[0] = log_startprob + log_emission[0]
+        
+        # Forward pass（只使用过去的观测）
+        for t in range(1, n_samples):
+            for j in range(n_states):
+                # alpha_t(j) = sum_i(alpha_{t-1}(i) * a_{ij}) * b_j(o_t)
+                log_alpha[t, j] = logsumexp(
+                    log_alpha[t-1] + log_transmat[:, j]
+                ) + log_emission[t, j]
+        
+        # 归一化得到 P(state_t | obs_1:t)
+        log_probs = logsumexp(log_alpha, axis=1, keepdims=True)
+        filtered_posteriors = np.exp(log_alpha - log_probs)
+        
+        return filtered_posteriors
+    
+    def generate_multistep_labels(
+        self,
+        filtered_posteriors: np.ndarray,
+        horizons: List[int] = None,
+        temperature: float = 1.5
+    ) -> Dict[str, np.ndarray]:
+        """
+        使用转移矩阵传播生成多步预测标签
+        
+        P(state_{t+k} | obs_1:t) = P(state_t | obs_1:t) @ A^k
+        
+        Args:
+            filtered_posteriors: 滤波后验概率，形状 (n_samples, n_states)
+                                应由 forward_filter() 生成
+            horizons: 预测步数列表，默认 [1, 2, 3, 4]
+            temperature: 软标签温度（>1 使分布更平滑），仅对 k >= 2 应用
+            
+        Returns:
+            标签字典:
+            {
+                'soft_t+1': 软标签概率分布 (n_samples, n_states),
+                'hard_t+1': 硬标签 (n_samples,),
+                'soft_t+2': ...,
+                'hard_t+2': ...,
+                ...
+            }
+        """
+        if horizons is None:
+            horizons = [1, 2, 3, 4]
+        
+        if self.transition_matrix_ is None:
+            raise ValueError(
+                "转移矩阵未初始化。请先调用 fit() 或 compute_transition_matrix()"
+            )
+        
+        transmat = self.transition_matrix_
+        labels = {}
+        
+        # 预计算转移矩阵的幂
+        transmat_powers = {1: transmat}
+        for k in range(2, max(horizons) + 1):
+            transmat_powers[k] = transmat_powers[k-1] @ transmat
+        
+        for k in horizons:
+            # 通过 k 步转移传播后验概率
+            future_probs = filtered_posteriors @ transmat_powers[k]
+            future_probs = np.clip(future_probs, 1e-7, 1.0)
+            future_probs /= future_probs.sum(axis=1, keepdims=True)
+            
+            # 对 k >= 2 应用温度缩放，使标签更平滑
+            if k >= 2 and temperature != 1.0:
+                log_probs = np.log(future_probs) / temperature
+                soft_probs = np.exp(log_probs - logsumexp(log_probs, axis=1, keepdims=True))
+            else:
+                soft_probs = future_probs
+            
+            labels[f'soft_t+{k}'] = soft_probs
+            labels[f'hard_t+{k}'] = np.argmax(future_probs, axis=1)
+        
+        # 添加置信度和熵指标
+        labels['confidence'] = np.max(filtered_posteriors, axis=1)
+        labels['entropy'] = -np.sum(
+            filtered_posteriors * np.log(filtered_posteriors + 1e-10), axis=1
+        )
+        
+        return labels
     
     def save(self, filepath: str):
         """保存模型（包括状态映射、特征 profile、BIC 等完整信息）"""
