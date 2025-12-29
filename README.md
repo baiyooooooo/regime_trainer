@@ -2,12 +2,85 @@
 
 自动化训练系统，用于训练和维护加密货币市场状态分类模型。支持任意交易对，自动数据获取、特征工程、HMM标注和LSTM训练。
 
+## 🚀 快速使用指南
+
+### 方式1：一键启动服务器（推荐）
+
+**同时运行 API 服务器和自动训练调度器**
+
+```bash
+python run_server.py
+```
+
+这将自动：
+- ✅ 启动 HTTP API 服务器（端口 5000）
+- ✅ 在后台启动训练调度器（自动执行增量训练）
+  - 15m 模型：每 3 小时增量训练一次
+  - 5m 模型：每 60 分钟增量训练一次
+
+**API 端点示例：**
+```bash
+# 健康检查
+curl http://localhost:5000/api/health
+
+# 预测下一根K线
+curl http://localhost:5000/api/predict/BTCUSDT?timeframe=15m
+
+# 多步预测（推荐）
+curl http://localhost:5000/api/predict_regimes/BTCUSDT?timeframe=15m
+```
+
+### 方式2：仅运行训练调度器
+
+**只启动自动增量训练，不提供 HTTP API**
+
+```bash
+python scheduler.py
+```
+
+这将：
+- ✅ 在后台自动执行增量训练
+- ✅ 15m 模型：每 3 小时训练一次
+- ✅ 5m 模型：每 60 分钟训练一次
+
+### 方式3：作为 Python 库使用
+
+**在其他 Python 程序中直接调用**
+
+```python
+from model_api import ModelAPI, predict_regime
+
+# 方式1：使用便捷函数
+result = predict_regime("BTCUSDT", "15m")
+print(result['most_likely_regime']['name'])
+
+# 方式2：使用 ModelAPI 类
+api = ModelAPI()
+result = api.predict_next_regime("BTCUSDT", primary_timeframe="15m")
+
+# 多步预测（推荐）
+result = api.predict_regimes("BTCUSDT", primary_timeframe="15m")
+print(result['predictions']['t+1']['most_likely'])
+```
+
+### 方式4：运行 HTTP 服务器（通过 model_api.py）
+
+**使用 model_api.py 启动 HTTP 服务器和调度器**
+
+```bash
+python model_api.py --server
+```
+
+功能与 `run_server.py` 相同。
+
+---
+
 ## 核心功能
 
 - 🎯 **预测下一根K线的market regime概率分布**
-- 🔄 **自动化训练**：增量训练（每天2次）+ 完整重训（每周1次）
+- 🔄 **自动化训练**：增量训练（自动调度）+ 完整重训（手动执行）
 - 📊 **6种市场状态**：Strong_Trend, Weak_Trend, Range, Choppy_High_Vol, Volatility_Spike, Squeeze
-- 🔌 **简单API接口**：供其他项目调用
+- 🔌 **简单API接口**：供其他项目调用（HTTP REST API 或 Python 库）
 - ⚡ **多时间框架支持**：独立的 5m 和 15m 模型，可并行预测
 
 **重要说明**：LSTM模型使用过去N根K线的特征序列，预测下一根K线的market regime。这是单步预测，不能直接预测多根K线。

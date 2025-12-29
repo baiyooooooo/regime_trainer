@@ -17,6 +17,10 @@ keras>=2.16.0
 # 任务调度
 schedule==1.2.0
 
+# Web API
+flask>=3.0.0
+flask-cors>=4.0.0
+
 # 工具
 python-dotenv==1.0.0
 tqdm==4.66.1

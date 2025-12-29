@@ -1,8 +1,17 @@
 """
-定时任务调度器 - 自动化训练调度
+定时任务调度器 - 自动化增量训练调度
+
+支持按时间框架分别调度增量训练：
+- 15m级别模型：每隔指定时间触发一次
+- 5m级别模型：每隔指定时间触发一次
+
+训练在后台线程执行，不阻塞API调用。
+
+注意：完整重训（full retrain）需要手动执行，不在此调度器中。
 """
 import schedule
 import time
+import threading
 import logging
 from datetime import datetime
 from config import TrainingConfig, setup_logging
@@ -18,46 +27,95 @@ class TrainingScheduler:
         self.config = config
         self.pipeline = TrainingPipeline(config)
         self.is_running = False
+        self.training_lock = threading.Lock()  # 防止多个训练任务同时运行
+        self.current_training = None  # 当前正在运行的训练线程
     
-    def incremental_training_job(self):
-        """增量训练任务"""
+    def _run_in_background(self, func, *args, **kwargs):
+        """在后台线程运行训练任务，避免阻塞主线程"""
+        def wrapper():
+            with self.training_lock:
+                try:
+                    func(*args, **kwargs)
+                except Exception as e:
+                    logger.error(f"后台训练任务异常: {e}", exc_info=True)
+                finally:
+                    self.current_training = None
+        
+        # 如果已有训练任务在运行，跳过本次任务
+        if self.current_training is not None and self.current_training.is_alive():
+            logger.warning("上一个训练任务仍在运行，跳过本次任务")
+            return
+        
+        thread = threading.Thread(target=wrapper, daemon=True)
+        thread.start()
+        self.current_training = thread
+        logger.info(f"训练任务已在后台线程启动: {thread.name}")
+    
+    def incremental_training_job_15m(self):
+        """15m级别模型的增量训练任务"""
         logger.info("="*80)
-        logger.info("触发增量训练任务")
+        logger.info("触发15m级别模型增量训练任务")
         logger.info("="*80)
         
-        try:
-            results = self.pipeline.train_all_symbols(training_type='incremental')
-            logger.info(f"增量训练完成，结果: {results}")
-        except Exception as e:
-            logger.error(f"增量训练失败: {e}", exc_info=True)
+        def train():
+            try:
+                # 训练所有交易对的15m模型
+                results = {}
+                for symbol in self.config.SYMBOLS:
+                    try:
+                        result = self.pipeline.incremental_train(
+                            symbol=symbol, 
+                            primary_timeframe="15m"
+                        )
+                        results[symbol] = result
+                        logger.info(f"✅ {symbol} 15m 增量训练完成")
+                    except Exception as e:
+                        logger.error(f"❌ {symbol} 15m 增量训练失败: {e}", exc_info=True)
+                        results[symbol] = {'error': str(e)}
+                
+                logger.info(f"15m级别模型增量训练完成，结果: {results}")
+            except Exception as e:
+                logger.error(f"15m级别模型增量训练失败: {e}", exc_info=True)
+        
+        self._run_in_background(train)
     
-    def full_retrain_job(self):
-        """完整重训任务"""
+    def incremental_training_job_5m(self):
+        """5m级别模型的增量训练任务"""
         logger.info("="*80)
-        logger.info("触发完整重训任务")
+        logger.info("触发5m级别模型增量训练任务")
         logger.info("="*80)
         
-        try:
-            results = self.pipeline.train_all_symbols(training_type='full')
-            logger.info(f"完整重训完成，结果: {results}")
-        except Exception as e:
-            logger.error(f"完整重训失败: {e}", exc_info=True)
+        def train():
+            try:
+                # 训练所有交易对的5m模型
+                results = {}
+                for symbol in self.config.SYMBOLS:
+                    try:
+                        result = self.pipeline.incremental_train(
+                            symbol=symbol, 
+                            primary_timeframe="5m"
+                        )
+                        results[symbol] = result
+                        logger.info(f"✅ {symbol} 5m 增量训练完成")
+                    except Exception as e:
+                        logger.error(f"❌ {symbol} 5m 增量训练失败: {e}", exc_info=True)
+                        results[symbol] = {'error': str(e)}
+                
+                logger.info(f"5m级别模型增量训练完成，结果: {results}")
+            except Exception as e:
+                logger.error(f"5m级别模型增量训练失败: {e}", exc_info=True)
+        
+        self._run_in_background(train)
     
     def setup_schedule(self):
         """设置调度任务"""
-        # 增量训练：每天 8am 和 8pm HKT
-        for train_time in self.config.INCREMENTAL_TRAIN_TIMES:
-            schedule.every().day.at(train_time).do(self.incremental_training_job)
-            logger.info(f"已设置增量训练任务: 每天 {train_time}")
+        # 15m级别模型：每隔1小时触发一次增量训练
+        schedule.every(3).hours.do(self.incremental_training_job_15m)
+        logger.info("已设置15m级别模型增量训练任务: 每隔3小时")
         
-        # 完整重训：每周日 3am HKT
-        day_name = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'][
-            self.config.FULL_RETRAIN_DAY
-        ]
-        getattr(schedule.every(), day_name).at(self.config.FULL_RETRAIN_TIME).do(
-            self.full_retrain_job
-        )
-        logger.info(f"已设置完整重训任务: 每周{day_name} {self.config.FULL_RETRAIN_TIME}")
+        # 5m级别模型：每隔指定时间触发一次增量训练
+        schedule.every(60).minutes.do(self.incremental_training_job_5m)
+        logger.info("已设置5m级别模型增量训练任务: 每隔60分钟")
     
     def run(self):
         """运行调度器"""
@@ -91,12 +149,6 @@ def main():
     
     # 创建调度器
     scheduler = TrainingScheduler(TrainingConfig)
-    
-    # 可选：立即执行一次完整重训（首次运行时）
-    import sys
-    if '--init' in sys.argv:
-        logger.info("首次运行，执行完整重训...")
-        scheduler.full_retrain_job()
     
     # 启动调度器
     scheduler.run()

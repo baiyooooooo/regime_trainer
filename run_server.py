@@ -1,0 +1,95 @@
+"""
+一键启动服务器 - 同时运行 API 服务器和训练调度器
+
+运行方式:
+    python run_server.py
+
+这将自动：
+1. 启动 HTTP API 服务器（端口 5000）
+2. 在后台启动训练调度器（自动执行增量训练）
+
+API 端点:
+    GET  /api/health
+    GET  /api/predict/<symbol>?timeframe=15m
+    GET  /api/predict_regimes/<symbol>?timeframe=15m
+    GET  /api/metadata/<symbol>?timeframe=15m
+    GET  /api/models/available
+    GET  /api/models/by_timeframe
+    POST /api/batch_predict
+"""
+import logging
+import threading
+import sys
+
+from config import TrainingConfig, setup_logging
+from model_api import ModelAPI, create_app
+from scheduler import TrainingScheduler
+
+# 配置日志
+setup_logging(log_file='server.log', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def main():
+    """主函数 - 启动 API 服务器和训练调度器"""
+    # 确保目录存在
+    TrainingConfig.ensure_dirs()
+    
+    # 初始化 API
+    api = ModelAPI()
+    
+    # 启动训练调度器（后台线程）
+    logger.info("正在启动训练调度器...")
+    scheduler = TrainingScheduler(TrainingConfig)
+    scheduler_thread = threading.Thread(target=scheduler.run, daemon=True)
+    scheduler_thread.start()
+    logger.info("✅ 训练调度器已启动（后台运行）")
+    
+    # 创建 Flask 应用
+    try:
+        app = create_app(api)
+    except ImportError as e:
+        logger.error(f"❌ 无法启动 HTTP 服务器: {e}")
+        logger.error("请安装 Flask 和 flask-cors: pip install flask flask-cors")
+        sys.exit(1)
+    
+    # 配置服务器
+    host = '0.0.0.0'
+    port = 5000
+    
+    # 显示启动信息
+    logger.info("="*80)
+    logger.info("🚀 API 服务器启动")
+    logger.info("="*80)
+    logger.info(f"📡 监听地址: http://{host}:{port}")
+    logger.info(f"📊 监控交易对: {TrainingConfig.SYMBOLS}")
+    logger.info("")
+    logger.info("API 端点:")
+    logger.info("  GET  /api/health                          - 健康检查")
+    logger.info("  GET  /api/predict/<symbol>?timeframe=15m  - 预测下一根K线")
+    logger.info("  GET  /api/predict_regimes/<symbol>        - 多步预测（推荐）")
+    logger.info("  GET  /api/metadata/<symbol>               - 获取模型元数据")
+    logger.info("  GET  /api/models/available                - 列出可用模型")
+    logger.info("  GET  /api/models/by_timeframe             - 按时间框架列出模型")
+    logger.info("  POST /api/batch_predict                   - 批量预测")
+    logger.info("")
+    logger.info("训练调度:")
+    logger.info(f"  ✅ 15m 模型: 每 {getattr(TrainingConfig, 'INCREMENTAL_TRAIN_INTERVAL_15M', 3)} 小时增量训练")
+    logger.info(f"  ✅ 5m 模型: 每 {getattr(TrainingConfig, 'INCREMENTAL_TRAIN_INTERVAL_5M', 60)} 分钟增量训练")
+    logger.info("")
+    logger.info("按 Ctrl+C 停止服务器")
+    logger.info("="*80)
+    
+    # 运行 Flask 应用
+    try:
+        app.run(host=host, port=port, debug=False, threaded=True)
+    except KeyboardInterrupt:
+        logger.info("\n正在关闭服务器...")
+        if scheduler:
+            scheduler.stop()
+        logger.info("服务器已停止")
+
+
+if __name__ == "__main__":
+    main()
+

@@ -33,6 +33,8 @@ class TrainingConfig:
             "sequence_length": 48,  # 48根5m K线 = 4小时
             "lstm_units": [96, 48],  # 增加容量以匹配更长的序列（48 vs 32）
             "dense_units": [48],  # 相应增加 Dense 层容量
+            "epochs": 80,  # 5m模型需要更多epoch才能收敛（更大的模型容量）
+            "early_stopping_patience": 12,  # 更大的patience，给5m模型更多训练机会
         },
         "15m": {
             "primary_timeframe": "15m",
@@ -40,6 +42,8 @@ class TrainingConfig:
             "sequence_length": 32,  # 32根15m K线 = 8小时
             "lstm_units": [64, 32],
             "dense_units": [32],
+            "epochs": 50,  # 15m模型使用默认epoch数
+            "early_stopping_patience": 8,  # 使用默认patience
         },
     }
     

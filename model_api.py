@@ -642,10 +642,189 @@ def get_regime_probability(
     return api.get_regime_probability(symbol, regime_name, primary_timeframe)
 
 
+# ==================== HTTP 服务器（可选） ====================
+
+def create_app(api_instance: ModelAPI = None):
+    """
+    创建 Flask 应用（可选功能）
+    
+    如果安装了 flask 和 flask-cors，可以使用此功能提供 HTTP REST API
+    
+    使用方式:
+        python model_api.py --server
+        或
+        from model_api import create_app
+        app = create_app()
+        app.run(port=5000)
+    """
+    try:
+        from flask import Flask, jsonify, request
+        from flask_cors import CORS
+    except ImportError:
+        raise ImportError(
+            "需要安装 flask 和 flask-cors 才能使用 HTTP 服务器功能:\n"
+            "pip install flask flask-cors"
+        )
+    
+    app = Flask(__name__)
+    CORS(app)
+    
+    api = api_instance or ModelAPI()
+    
+    def datetime_to_str(obj):
+        """将 datetime 对象转换为字符串"""
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        elif isinstance(obj, dict):
+            return {k: datetime_to_str(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [datetime_to_str(item) for item in obj]
+        return obj
+    
+    @app.route('/api/health', methods=['GET'])
+    def health():
+        """健康检查端点"""
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat()
+        })
+    
+    @app.route('/api/predict/<symbol>', methods=['GET'])
+    def predict(symbol: str):
+        """预测下一根K线的market regime"""
+        try:
+            timeframe = request.args.get('timeframe', '15m')
+            if timeframe not in ['5m', '15m']:
+                return jsonify({'error': f'不支持的时间框架: {timeframe}'}), 400
+            result = api.predict_next_regime(symbol, primary_timeframe=timeframe)
+            return jsonify(datetime_to_str(result))
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 404
+        except Exception as e:
+            logger.error(f"预测失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/predict_regimes/<symbol>', methods=['GET'])
+    def predict_regimes(symbol: str):
+        """多步预测（t+1 到 t+4）"""
+        try:
+            timeframe = request.args.get('timeframe', '15m')
+            include_history = request.args.get('include_history', 'true').lower() == 'true'
+            if timeframe not in ['5m', '15m']:
+                return jsonify({'error': f'不支持的时间框架: {timeframe}'}), 400
+            result = api.predict_regimes(symbol, primary_timeframe=timeframe, include_history=include_history)
+            return jsonify(datetime_to_str(result))
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 404
+        except Exception as e:
+            logger.error(f"多步预测失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/metadata/<symbol>', methods=['GET'])
+    def get_metadata(symbol: str):
+        """获取模型元数据"""
+        try:
+            timeframe = request.args.get('timeframe', '15m')
+            if timeframe not in ['5m', '15m']:
+                return jsonify({'error': f'不支持的时间框架: {timeframe}'}), 400
+            metadata = api.get_model_metadata(symbol, primary_timeframe=timeframe)
+            return jsonify(datetime_to_str(metadata))
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 404
+        except Exception as e:
+            logger.error(f"获取元数据失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/models/available', methods=['GET'])
+    def list_available():
+        """列出可用模型"""
+        try:
+            timeframe = request.args.get('timeframe')
+            if timeframe:
+                if timeframe not in ['5m', '15m']:
+                    return jsonify({'error': f'不支持的时间框架: {timeframe}'}), 400
+                models = api.list_available_models(primary_timeframe=timeframe)
+            else:
+                models = api.list_available_models()
+            return jsonify({'available_models': models, 'count': len(models)})
+        except Exception as e:
+            logger.error(f"列出可用模型失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/models/by_timeframe', methods=['GET'])
+    def list_by_timeframe():
+        """按时间框架列出模型"""
+        try:
+            models_by_tf = api.list_available_models_by_timeframe()
+            return jsonify(models_by_tf)
+        except Exception as e:
+            logger.error(f"按时间框架列出模型失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/batch_predict', methods=['POST'])
+    def batch_predict():
+        """批量预测"""
+        try:
+            data = request.get_json()
+            if not data or 'symbols' not in data:
+                return jsonify({'error': '请求体必须包含 symbols 字段'}), 400
+            symbols = data['symbols']
+            timeframe = data.get('timeframe', '15m')
+            if not isinstance(symbols, list):
+                return jsonify({'error': 'symbols 必须是列表'}), 400
+            if timeframe not in ['5m', '15m']:
+                return jsonify({'error': f'不支持的时间框架: {timeframe}'}), 400
+            results = api.batch_predict(symbols, primary_timeframe=timeframe)
+            return jsonify(datetime_to_str(results))
+        except Exception as e:
+            logger.error(f"批量预测失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    return app
+
+
 # ==================== 主函数（示例） ====================
 
 def main():
-    """示例用法"""
+    """主函数 - 支持多种运行模式"""
+    import sys
+    
+    # 检查是否要运行 HTTP 服务器
+    if '--server' in sys.argv or '--http' in sys.argv:
+        # 运行 HTTP 服务器模式
+        import threading
+        from scheduler import TrainingScheduler
+        
+        TrainingConfig.ensure_dirs()
+        
+        # 启动调度器（后台线程）
+        scheduler = TrainingScheduler(TrainingConfig)
+        scheduler_thread = threading.Thread(target=scheduler.run, daemon=True)
+        scheduler_thread.start()
+        logger.info("训练调度器已在后台线程启动")
+        
+        # 创建并运行 Flask 应用
+        app = create_app()
+        host = '0.0.0.0'
+        port = 5000
+        
+        logger.info("="*80)
+        logger.info("API 服务器启动")
+        logger.info(f"监听地址: http://{host}:{port}")
+        logger.info("API 端点:")
+        logger.info("  GET  /api/health")
+        logger.info("  GET  /api/predict/<symbol>?timeframe=15m")
+        logger.info("  GET  /api/predict_regimes/<symbol>?timeframe=15m")
+        logger.info("  GET  /api/metadata/<symbol>?timeframe=15m")
+        logger.info("  GET  /api/models/available")
+        logger.info("  GET  /api/models/by_timeframe")
+        logger.info("  POST /api/batch_predict")
+        logger.info("="*80)
+        
+        app.run(host=host, port=port, debug=False, threaded=True)
+        return
+    
+    # 默认：运行示例代码
     api = ModelAPI()
     
     # 列出可用的模型
