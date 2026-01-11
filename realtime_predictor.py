@@ -3,8 +3,8 @@
 """
 import logging
 import os
-from datetime import datetime
-from typing import Dict, Tuple
+from datetime import datetime, timedelta
+from typing import Dict, Tuple, Optional
 import pandas as pd
 import numpy as np
 
@@ -332,41 +332,133 @@ class RealtimeRegimePredictor:
             logger.error(f"预测失败: {e}", exc_info=True)
             raise
     
-    def get_regime_history(self, lookback_hours: int = 24) -> pd.DataFrame:
+    def get_regime_history(
+        self, 
+        lookback_hours: int = None,
+        start_date: datetime = None,
+        end_date: datetime = None
+    ) -> pd.DataFrame:
         """
         获取历史市场状态（滑动窗口预测）
         
+        支持两种查询方式：
+        1. 按回看小时数：指定 lookback_hours，从当前时间往前回看
+        2. 按日期范围：指定 start_date 和 end_date，获取指定时间范围的regime
+        
         Args:
-            lookback_hours: 回看小时数
+            lookback_hours: 回看小时数（如果指定，则从当前时间往前回看）
+            start_date: 开始日期时间（如果指定，则获取指定时间范围）
+            end_date: 结束日期时间（如果指定，则获取指定时间范围）
             
         Returns:
-            包含历史预测的 DataFrame
+            包含历史预测的 DataFrame，列包括：
+            - timestamp: 时间戳
+            - regime_id: 状态ID
+            - regime_name: 状态名称
+            - confidence: 置信度
+            - is_uncertain: 是否不确定
+            - original_regime: 原始状态名称
         """
         try:
-            # 获取足够的历史数据
-            days = max(7, lookback_hours // 24 + 1)
-            
-            data = self.data_fetcher.fetch_latest_data(
-                symbol=self.symbol,
-                timeframes=self.timeframes,
-                days=days
-            )
-            
-            # 计算特征
-            features = self.feature_engineer.combine_timeframe_features(
-                data,
-                primary_timeframe=self.primary_timeframe,
-                symbol=self.symbol
-            )
-            
-            # 只取最近的数据（根据时间框架计算需要的行数）
-            # 主时间框架是 15m，所以 24 小时 = 24 * 60 / 15 = 96 行
-            # 但为了安全，我们获取更多数据以确保有足够的数据进行预测
-            timeframe_minutes = self._get_timeframe_minutes(self.primary_timeframe)
-            rows_needed = (lookback_hours * 60) // timeframe_minutes
-            # 加上 sequence_length 以确保有足够的数据进行滑动窗口预测
-            min_rows = rows_needed + self.lstm_classifier.sequence_length
-            features = features.tail(min_rows)
+            # 确定查询方式
+            if start_date is not None and end_date is not None:
+                # 按日期范围查询
+                if start_date >= end_date:
+                    raise ValueError("start_date 必须早于 end_date")
+                
+                # 计算需要的天数（多获取一些以确保有足够数据计算特征）
+                days_needed = (end_date - start_date).days + 7  # 额外7天用于特征计算
+                start_date_for_fetch = start_date - timedelta(days=7)
+                
+                # 从缓存获取数据（优先使用缓存）
+                if self.data_fetcher.cache_enabled and self.data_fetcher.cache_manager:
+                    cached_data = {}
+                    for tf in self.timeframes:
+                        cached_df = self.data_fetcher.cache_manager.get_cached_data(
+                            symbol=self.symbol,
+                            timeframe=tf,
+                            start_date=start_date_for_fetch.date(),
+                            end_date=end_date.date()
+                        )
+                        if not cached_df.empty:
+                            cached_data[tf] = cached_df
+                    
+                    # 如果缓存中有数据，使用缓存数据
+                    if cached_data:
+                        logger.info(
+                            f"从缓存获取历史数据: {self.symbol} "
+                            f"{start_date.date()} 至 {end_date.date()}"
+                        )
+                        data = cached_data
+                    else:
+                        # 缓存中没有数据，从API获取
+                        logger.info(
+                            f"缓存中没有数据，从API获取: {self.symbol} "
+                            f"{start_date_for_fetch.date()} 至 {end_date.date()}"
+                        )
+                        data = self.data_fetcher.fetch_latest_data(
+                            symbol=self.symbol,
+                            timeframes=self.timeframes,
+                            days=days_needed
+                        )
+                else:
+                    # 缓存未启用，从API获取
+                    data = self.data_fetcher.fetch_latest_data(
+                        symbol=self.symbol,
+                        timeframes=self.timeframes,
+                        days=days_needed
+                    )
+                
+                # 计算特征
+                features = self.feature_engineer.combine_timeframe_features(
+                    data,
+                    primary_timeframe=self.primary_timeframe,
+                    symbol=self.symbol
+                )
+                
+                # 过滤到指定日期范围
+                features = features[(features.index >= start_date) & (features.index <= end_date)]
+                
+            elif lookback_hours is not None:
+                # 按回看小时数查询（原有逻辑）
+                days = max(7, lookback_hours // 24 + 1)
+                
+                data = self.data_fetcher.fetch_latest_data(
+                    symbol=self.symbol,
+                    timeframes=self.timeframes,
+                    days=days
+                )
+                
+                # 计算特征
+                features = self.feature_engineer.combine_timeframe_features(
+                    data,
+                    primary_timeframe=self.primary_timeframe,
+                    symbol=self.symbol
+                )
+                
+                # 只取最近的数据（根据时间框架计算需要的行数）
+                timeframe_minutes = self._get_timeframe_minutes(self.primary_timeframe)
+                rows_needed = (lookback_hours * 60) // timeframe_minutes
+                # 加上 sequence_length 以确保有足够的数据进行滑动窗口预测
+                min_rows = rows_needed + self.lstm_classifier.sequence_length
+                features = features.tail(min_rows)
+            else:
+                # 默认：回看24小时
+                days = 7
+                data = self.data_fetcher.fetch_latest_data(
+                    symbol=self.symbol,
+                    timeframes=self.timeframes,
+                    days=days
+                )
+                features = self.feature_engineer.combine_timeframe_features(
+                    data,
+                    primary_timeframe=self.primary_timeframe,
+                    symbol=self.symbol
+                )
+                timeframe_minutes = self._get_timeframe_minutes(self.primary_timeframe)
+                rows_needed = (24 * 60) // timeframe_minutes
+                min_rows = rows_needed + self.lstm_classifier.sequence_length
+                features = features.tail(min_rows)
             
             # 对齐特征名称（与训练时保持一致）
             feature_names = self.lstm_classifier.feature_names_
@@ -399,16 +491,31 @@ class RealtimeRegimePredictor:
                     f"建议获取更多历史数据。"
                 )
                 # 返回空 DataFrame，但包含正确的列
-                return pd.DataFrame(columns=['timestamp', 'regime_id', 'regime_name', 'confidence'])
+                return pd.DataFrame(columns=['timestamp', 'regime_id', 'regime_name', 'confidence', 'is_uncertain', 'original_regime'])
             
-            # 滑动窗口预测（带置信度拒绝）
-            predictions = []
+            # 批量预测（优化性能）
             features_scaled = self.lstm_classifier.scaler.transform(features)
             confidence_threshold = getattr(self.config, 'CONFIDENCE_THRESHOLD', 0.4)
             
+            # 准备批量输入数据
+            batch_X = []
+            batch_indices = []
+            
             for i in range(sequence_length, len(features_scaled)):
-                X = np.array([features_scaled[i-sequence_length:i]])
-                proba = self.lstm_classifier.predict_proba(X)[0]
+                batch_X.append(features_scaled[i-sequence_length:i])
+                batch_indices.append(i)
+            
+            if not batch_X:
+                logger.warning("没有生成任何预测结果")
+                return pd.DataFrame(columns=['timestamp', 'regime_id', 'regime_name', 'confidence', 'is_uncertain', 'original_regime'])
+            
+            # 批量预测（一次性预测所有样本，提高性能）
+            batch_X = np.array(batch_X)
+            batch_proba = self.lstm_classifier.predict_proba(batch_X)
+            
+            # 处理预测结果
+            predictions = []
+            for idx, proba in zip(batch_indices, batch_proba):
                 regime_id = np.argmax(proba)
                 confidence = float(proba[regime_id])
                 
@@ -417,7 +524,7 @@ class RealtimeRegimePredictor:
                 regime_name = "Uncertain" if is_uncertain else self._get_regime_name(regime_id)
                 
                 predictions.append({
-                    'timestamp': features.index[i],
+                    'timestamp': features.index[idx],
                     'regime_id': regime_id,
                     'regime_name': regime_name,
                     'confidence': confidence,

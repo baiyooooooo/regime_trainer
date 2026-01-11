@@ -3,7 +3,7 @@ API 测试脚本 - 验证多步预测 API 工作正常
 """
 import sys
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from model_api import ModelAPI
 from config import TrainingConfig
 
@@ -228,10 +228,87 @@ def test_get_model_metadata():
         return False
 
 
+def test_get_regime_history():
+    """测试 get_regime_history() API"""
+    print("\n" + "="*80)
+    print("测试 5: get_regime_history() - 历史regime序列")
+    print("="*80)
+    
+    try:
+        api = ModelAPI()
+        
+        available = api.list_available_models()
+        if not available:
+            print("❌ 没有可用的模型")
+            return False
+        
+        symbol = available[0]
+        
+        # 测试1: 按回看小时数
+        print(f"\n测试1: 按回看小时数查询（24小时）")
+        result1 = api.get_regime_history(
+            symbol=symbol,
+            lookback_hours=24,
+            primary_timeframe="15m"
+        )
+        
+        assert 'symbol' in result1, "缺少 'symbol' 字段"
+        assert 'timeframe' in result1, "缺少 'timeframe' 字段"
+        assert 'history' in result1, "缺少 'history' 字段"
+        assert 'count' in result1, "缺少 'count' 字段"
+        assert isinstance(result1['history'], list), "'history' 应该是列表"
+        
+        print(f"  ✅ 按回看小时数查询成功")
+        print(f"  - 交易对: {result1['symbol']}")
+        print(f"  - 时间框架: {result1['timeframe']}")
+        print(f"  - 回看小时数: {result1['lookback_hours']}")
+        print(f"  - 记录数量: {result1['count']}")
+        
+        if result1['count'] > 0:
+            first_record = result1['history'][0]
+            assert 'timestamp' in first_record, "历史记录缺少 'timestamp'"
+            assert 'regime_name' in first_record, "历史记录缺少 'regime_name'"
+            assert 'confidence' in first_record, "历史记录缺少 'confidence'"
+            print(f"  - 第一条记录: {first_record['timestamp']} -> {first_record['regime_name']} ({first_record['confidence']:.2%})")
+        
+        # 测试2: 按日期范围查询
+        print(f"\n测试2: 按日期范围查询（最近7天）")
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=7)
+        
+        result2 = api.get_regime_history(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            primary_timeframe="15m"
+        )
+        
+        assert 'symbol' in result2, "缺少 'symbol' 字段"
+        assert 'start_date' in result2, "缺少 'start_date' 字段"
+        assert 'end_date' in result2, "缺少 'end_date' 字段"
+        assert 'history' in result2, "缺少 'history' 字段"
+        
+        print(f"  ✅ 按日期范围查询成功")
+        print(f"  - 交易对: {result2['symbol']}")
+        print(f"  - 时间框架: {result2['timeframe']}")
+        print(f"  - 开始日期: {result2['start_date']}")
+        print(f"  - 结束日期: {result2['end_date']}")
+        print(f"  - 记录数量: {result2['count']}")
+        
+        print("\n✅ get_regime_history() 测试通过!")
+        return True
+        
+    except Exception as e:
+        print(f"\n❌ get_regime_history() 测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def test_batch_predict():
     """测试 batch_predict() API"""
     print("\n" + "="*80)
-    print("测试 5: batch_predict() - 批量预测")
+    print("测试 6: batch_predict() - 批量预测")
     print("="*80)
     
     try:
@@ -284,6 +361,7 @@ def main():
     results.append(("predict_next_regime", test_predict_next_regime()))
     results.append(("predict_multi_timeframe_regimes", test_predict_multi_timeframe_regimes()))
     results.append(("get_model_metadata", test_get_model_metadata()))
+    results.append(("get_regime_history", test_get_regime_history()))
     results.append(("batch_predict", test_batch_predict()))
     
     # 汇总结果

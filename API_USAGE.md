@@ -132,6 +132,73 @@ for symbol, result in results.items():
         print(f"{symbol}: 错误 - {result['error']}")
 ```
 
+### 6. 获取历史 Market Regime 序列
+
+**新增功能**：获取历史上的 market regime 序列，支持回测场景。
+
+```python
+from datetime import datetime, timedelta
+
+api = ModelAPI()
+
+# 方式1: 按回看小时数查询（从当前时间往前回看）
+result = api.get_regime_history(
+    symbol="BTCUSDT",
+    lookback_hours=24,  # 回看24小时
+    primary_timeframe="15m"
+)
+
+# 方式2: 按日期范围查询（适合回测）
+end_date = datetime.now()
+start_date = end_date - timedelta(days=30)  # 最近30天
+
+result = api.get_regime_history(
+    symbol="BTCUSDT",
+    start_date=start_date,
+    end_date=end_date,
+    primary_timeframe="15m"
+)
+
+# 返回结果格式
+{
+    'symbol': 'BTCUSDT',
+    'timeframe': '15m',
+    'lookback_hours': 24,  # 或 None（如果使用日期范围）
+    'start_date': None,     # 或 ISO 格式日期字符串
+    'end_date': None,       # 或 ISO 格式日期字符串
+    'timestamp': datetime(...),
+    'count': 96,            # 记录数量
+    'history': [
+        {
+            'timestamp': '2024-01-01T11:45:00',
+            'regime_id': 0,
+            'regime_name': 'Range',
+            'confidence': 0.85,
+            'is_uncertain': False,
+            'original_regime': 'Range'
+        },
+        ...
+    ]
+}
+
+# 使用示例：遍历历史regime
+for record in result['history']:
+    print(f"{record['timestamp']}: {record['regime_name']} ({record['confidence']:.2%})")
+```
+
+**参数说明**：
+- `lookback_hours`: 回看小时数（最大720小时/30天）
+- `start_date`: 开始日期时间（datetime对象）
+- `end_date`: 结束日期时间（datetime对象，最大范围365天）
+- 如果指定了 `start_date` 和 `end_date`，则使用日期范围查询
+- 如果只指定了 `lookback_hours`，则从当前时间往前回看
+- 如果都不指定，默认回看24小时
+
+**性能优化**：
+- 优先从SQLite缓存读取历史K线数据
+- 使用批量预测提高性能（一次性预测所有历史样本）
+- 适合回测场景，支持长时间范围查询
+
 ## 完整示例
 
 ```python
@@ -265,3 +332,16 @@ A: 目前只支持训练时使用的主时间框架（默认15m）。要支持�
 **Q: 如何更新模型？**
 A: 使用 `training_pipeline.py` 进行增量训练或完整重训。训练完成后，API会自动使用新的模型。
 
+**Q: 如何获取历史regime数据用于回测？**
+A: 使用 `get_regime_history()` 方法，支持按回看小时数或日期范围查询。例如：
+```python
+# 获取最近30天的历史regime
+from datetime import datetime, timedelta
+api = ModelAPI()
+end_date = datetime.now()
+start_date = end_date - timedelta(days=30)
+history = api.get_regime_history("BTCUSDT", start_date=start_date, end_date=end_date)
+```
+
+**Q: 历史regime数据从哪里获取？**
+A: 优先从SQLite缓存数据库读取历史K线数据，如果缓存中没有数据，会从Binance API获取。历史regime是通过LSTM模型对历史K线数据进行滑动窗口预测得到的。

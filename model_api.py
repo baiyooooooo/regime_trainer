@@ -562,6 +562,104 @@ class ModelAPI:
         # 如果找不到，返回0.0
         logger.warning(f"未找到状态 '{regime_name}'，可用状态: {list(regime_probs.keys())}")
         return 0.0
+    
+    def get_regime_history(
+        self,
+        symbol: str,
+        lookback_hours: int = None,
+        start_date: datetime = None,
+        end_date: datetime = None,
+        primary_timeframe: str = None
+    ) -> Dict:
+        """
+        获取历史上的 market regime 序列
+        
+        支持两种查询方式：
+        1. 按回看小时数：指定 lookback_hours，从当前时间往前回看
+        2. 按日期范围：指定 start_date 和 end_date，获取指定时间范围的regime
+        
+        Args:
+            symbol: 交易对（如 "BTCUSDT"）
+            lookback_hours: 回看小时数（如果指定，则从当前时间往前回看）
+            start_date: 开始日期时间（如果指定，则获取指定时间范围）
+            end_date: 结束日期时间（如果指定，则获取指定时间范围）
+            primary_timeframe: 主时间框架（如 "5m", "15m"），如果为 None 则使用默认配置
+            
+        Returns:
+            包含历史regime序列的字典:
+            {
+                'symbol': str,
+                'timeframe': str,
+                'lookback_hours': int or None,
+                'start_date': datetime or None,
+                'end_date': datetime or None,
+                'timestamp': datetime,
+                'history': [
+                    {
+                        'timestamp': datetime,
+                        'regime_id': int,
+                        'regime_name': str,
+                        'confidence': float,
+                        'is_uncertain': bool,
+                        'original_regime': str
+                    },
+                    ...
+                ],
+                'count': int
+            }
+        """
+        if primary_timeframe is None:
+            primary_timeframe = self.config.PRIMARY_TIMEFRAME
+        
+        # 如果没有指定任何参数，默认回看24小时
+        if lookback_hours is None and start_date is None and end_date is None:
+            lookback_hours = 24
+        
+        # 获取预测器
+        predictor = self._get_predictor(symbol, primary_timeframe)
+        
+        # 获取历史regime序列
+        history_df = predictor.get_regime_history(
+            lookback_hours=lookback_hours,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        # 转换为字典格式
+        history_list = []
+        for _, row in history_df.iterrows():
+            history_list.append({
+                'timestamp': row['timestamp'].isoformat() if hasattr(row['timestamp'], 'isoformat') else str(row['timestamp']),
+                'regime_id': int(row['regime_id']),
+                'regime_name': str(row['regime_name']),
+                'confidence': float(row['confidence']),
+                'is_uncertain': bool(row.get('is_uncertain', False)),
+                'original_regime': str(row.get('original_regime', row['regime_name']))
+            })
+        
+        result = {
+            'symbol': symbol,
+            'timeframe': primary_timeframe,
+            'lookback_hours': lookback_hours,
+            'start_date': start_date.isoformat() if start_date else None,
+            'end_date': end_date.isoformat() if end_date else None,
+            'timestamp': datetime.now(),
+            'history': history_list,
+            'count': len(history_list)
+        }
+        
+        if start_date and end_date:
+            logger.info(
+                f"获取 {symbol} ({primary_timeframe}) 的历史regime: "
+                f"{start_date.date()} 至 {end_date.date()}，共 {len(history_list)} 条记录"
+            )
+        else:
+            logger.info(
+                f"获取 {symbol} ({primary_timeframe}) 的历史regime: "
+                f"回看 {lookback_hours} 小时，共 {len(history_list)} 条记录"
+            )
+        
+        return result
 
 
 # ==================== 便捷函数 ====================
@@ -780,6 +878,99 @@ def create_app(api_instance: ModelAPI = None):
             logger.error(f"批量预测失败: {e}", exc_info=True)
             return jsonify({'error': str(e)}), 500
     
+    @app.route('/api/history/<symbol>', methods=['GET'])
+    def get_history(symbol: str):
+        """
+        获取历史上的market regime序列
+        
+        支持两种查询方式：
+        1. 按回看小时数：?timeframe=15m&lookback_hours=24
+        2. 按日期范围：?timeframe=15m&start_date=2024-01-01&end_date=2024-01-31
+        
+        日期格式：ISO 8601 (YYYY-MM-DD 或 YYYY-MM-DDTHH:MM:SS)
+        """
+        try:
+            timeframe = request.args.get('timeframe', '15m')
+            lookback_hours = request.args.get('lookback_hours', type=int)
+            start_date_str = request.args.get('start_date')
+            end_date_str = request.args.get('end_date')
+            
+            if timeframe not in ['5m', '15m']:
+                return jsonify({'error': f'不支持的时间框架: {timeframe}'}), 400
+            
+            # 解析日期
+            start_date = None
+            end_date = None
+            if start_date_str:
+                try:
+                    start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00'))
+                except ValueError:
+                    return jsonify({'error': f'无效的 start_date 格式: {start_date_str}，请使用 ISO 8601 格式'}), 400
+            
+            if end_date_str:
+                try:
+                    end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+                except ValueError:
+                    return jsonify({'error': f'无效的 end_date 格式: {end_date_str}，请使用 ISO 8601 格式'}), 400
+            
+            # 验证参数
+            if start_date_str and not end_date_str:
+                return jsonify({'error': '如果指定了 start_date，必须同时指定 end_date'}), 400
+            
+            if end_date_str and not start_date_str:
+                return jsonify({'error': '如果指定了 end_date，必须同时指定 start_date'}), 400
+            
+            if start_date and end_date:
+                if start_date >= end_date:
+                    return jsonify({'error': 'start_date 必须早于 end_date'}), 400
+                
+                # 限制最大日期范围（1年）
+                max_days = 365
+                if (end_date - start_date).days > max_days:
+                    return jsonify({
+                        'error': f'日期范围不能超过 {max_days} 天（1年）'
+                    }), 400
+            
+            if lookback_hours is not None:
+                if lookback_hours <= 0:
+                    return jsonify({'error': 'lookback_hours 必须大于 0'}), 400
+                
+                # 限制最大回看时间（30天）
+                max_lookback_hours = 720  # 30天
+                if lookback_hours > max_lookback_hours:
+                    return jsonify({
+                        'error': f'lookback_hours 不能超过 {max_lookback_hours} 小时（30天）'
+                    }), 400
+            
+            # 如果同时指定了日期范围和回看小时数，优先使用日期范围
+            if start_date and end_date:
+                result = api.get_regime_history(
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    primary_timeframe=timeframe
+                )
+            elif lookback_hours is not None:
+                result = api.get_regime_history(
+                    symbol=symbol,
+                    lookback_hours=lookback_hours,
+                    primary_timeframe=timeframe
+                )
+            else:
+                # 默认回看24小时
+                result = api.get_regime_history(
+                    symbol=symbol,
+                    lookback_hours=24,
+                    primary_timeframe=timeframe
+                )
+            
+            return jsonify(datetime_to_str(result))
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 404
+        except Exception as e:
+            logger.error(f"获取历史regime失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
     return app
 
 
@@ -815,6 +1006,8 @@ def main():
         logger.info("  GET  /api/health")
         logger.info("  GET  /api/predict/<symbol>?timeframe=15m")
         logger.info("  GET  /api/predict_regimes/<symbol>?timeframe=15m")
+        logger.info("  GET  /api/history/<symbol>?timeframe=15m&lookback_hours=24")
+        logger.info("  GET  /api/history/<symbol>?timeframe=15m&start_date=2024-01-01&end_date=2024-01-31")
         logger.info("  GET  /api/metadata/<symbol>?timeframe=15m")
         logger.info("  GET  /api/models/available")
         logger.info("  GET  /api/models/by_timeframe")

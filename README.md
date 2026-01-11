@@ -21,13 +21,17 @@ python run_server.py
 **API 端点示例：**
 ```bash
 # 健康检查
-curl http://localhost:5000/api/health
+curl http://localhost:5858/api/health
 
 # 预测下一根K线
-curl http://localhost:5000/api/predict/BTCUSDT?timeframe=15m
+curl http://localhost:5858/api/predict/BTCUSDT?timeframe=15m
 
 # 多步预测（推荐）
-curl http://localhost:5000/api/predict_regimes/BTCUSDT?timeframe=15m
+curl http://localhost:5858/api/predict_regimes/BTCUSDT?timeframe=15m
+
+# 获取历史regime序列（新增）
+curl "http://localhost:5858/api/history/BTCUSDT?timeframe=15m&lookback_hours=24"
+curl "http://localhost:5858/api/history/BTCUSDT?timeframe=15m&start_date=2024-01-01&end_date=2024-01-31"
 ```
 
 ### 方式2：仅运行训练调度器
@@ -293,6 +297,72 @@ results = api.predict_multi_timeframe_regimes(
 - **短期决策**：5m 模型捕捉快速变化，适合 3-5 分钟决策周期
 - **趋势确认**：对比 5m 和 15m 状态是否一致，判断趋势强度
 - **入场时机**：15m 确认大方向，5m 寻找精确入场点
+
+#### 6. 获取历史 Market Regime 序列（新增）
+
+**用于回测场景**：获取历史上的 market regime 序列，支持按回看小时数或日期范围查询。
+
+```python
+from datetime import datetime, timedelta
+
+api = ModelAPI()
+
+# 方式1: 按回看小时数查询（从当前时间往前回看）
+result = api.get_regime_history(
+    symbol="BTCUSDT",
+    lookback_hours=24,  # 回看24小时
+    primary_timeframe="15m"
+)
+
+# 方式2: 按日期范围查询（适合回测）
+end_date = datetime.now()
+start_date = end_date - timedelta(days=30)  # 最近30天
+
+result = api.get_regime_history(
+    symbol="BTCUSDT",
+    start_date=start_date,
+    end_date=end_date,
+    primary_timeframe="15m"
+)
+
+# Response
+{
+    'symbol': 'BTCUSDT',
+    'timeframe': '15m',
+    'lookback_hours': 24,  # 或 None（如果使用日期范围）
+    'start_date': None,     # 或 ISO 格式日期字符串
+    'end_date': None,       # 或 ISO 格式日期字符串
+    'timestamp': datetime(...),
+    'count': 96,            # 记录数量
+    'history': [
+        {
+            'timestamp': '2024-01-01T11:45:00',
+            'regime_id': 0,
+            'regime_name': 'Range',
+            'confidence': 0.85,
+            'is_uncertain': False,
+            'original_regime': 'Range'
+        },
+        ...
+    ]
+}
+```
+
+**HTTP API 端点**：
+```bash
+# 按回看小时数
+GET /api/history/BTCUSDT?timeframe=15m&lookback_hours=24
+
+# 按日期范围
+GET /api/history/BTCUSDT?timeframe=15m&start_date=2024-01-01&end_date=2024-01-31
+```
+
+**特性**：
+- ✅ 支持按回看小时数或日期范围查询
+- ✅ 优先从SQLite缓存读取历史K线数据
+- ✅ 批量预测优化，适合长时间范围查询
+- ✅ 最大支持30天回看或1年日期范围
+- ✅ 适合回测场景，可获取任意历史时间段的regime序列
 
 ## 模型参数
 

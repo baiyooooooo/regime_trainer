@@ -5,7 +5,7 @@
     python run_server.py
 
 这将自动：
-1. 启动 HTTP API 服务器（端口 5000）
+1. 启动 HTTP API 服务器（端口 5858）
 2. 在后台启动训练调度器（自动执行增量训练）
 
 API 端点:
@@ -55,7 +55,7 @@ def main():
     
     # 配置服务器
     host = '0.0.0.0'
-    port = 5000
+    port = 5858
     
     # 显示启动信息
     logger.info("="*80)
@@ -68,6 +68,7 @@ def main():
     logger.info("  GET  /api/health                          - 健康检查")
     logger.info("  GET  /api/predict/<symbol>?timeframe=15m  - 预测下一根K线")
     logger.info("  GET  /api/predict_regimes/<symbol>        - 多步预测（推荐）")
+    logger.info("  GET  /api/history/<symbol>                - 获取历史regime序列（支持日期范围）")
     logger.info("  GET  /api/metadata/<symbol>               - 获取模型元数据")
     logger.info("  GET  /api/models/available                - 列出可用模型")
     logger.info("  GET  /api/models/by_timeframe             - 按时间框架列出模型")
