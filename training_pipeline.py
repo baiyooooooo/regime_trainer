@@ -331,6 +331,25 @@ class TrainingPipeline:
                         min_ratio_per_state=getattr(self.config, 'MIN_RATIO_PER_STATE', 0.01)
                     )
                     
+                    # ⚠️ 关键修复：状态数量调整后，需要重新生成多步预测标签
+                    # 因为标签的维度必须与新的状态数量匹配
+                    logger.info(f"重新生成多步预测标签（状态数量已从 {n_states_optimization['original_n_states']} 调整为 {new_n_states}）...")
+                    train_posteriors = hmm_labeler.forward_filter(train_features)
+                    val_posteriors = hmm_labeler.forward_filter(val_features)
+                    test_posteriors = hmm_labeler.forward_filter(test_features) if test_features is not None else None
+                    
+                    train_multistep_labels = hmm_labeler.generate_multistep_labels(
+                        train_posteriors, horizons=prediction_horizons, temperature=label_temperature
+                    )
+                    val_multistep_labels = hmm_labeler.generate_multistep_labels(
+                        val_posteriors, horizons=prediction_horizons, temperature=label_temperature
+                    )
+                    test_multistep_labels = None
+                    if test_posteriors is not None:
+                        test_multistep_labels = hmm_labeler.generate_multistep_labels(
+                            test_posteriors, horizons=prediction_horizons, temperature=label_temperature
+                        )
+                    
                     # 输出状态调整总结
                     self._log_state_adjustment_summary(
                         original_n_states=n_states_optimization['original_n_states'],
