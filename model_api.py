@@ -19,7 +19,7 @@ import numpy as np
 from config import TrainingConfig, setup_logging
 from realtime_predictor import RealtimeRegimePredictor, MultiTimeframeRegimePredictor
 from model_registry import get_prod_info, set_prod, list_versions
-from forward_testing import trigger_all_pending_forward_tests, ForwardTestCronManager
+from forward_testing import trigger_all_pending_forward_tests, ForwardTestCronManager, get_campaign_accuracy
 
 setup_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1400,6 +1400,79 @@ def create_app(api_instance: ModelAPI = None):
             return jsonify(datetime_to_str(summary))
         except Exception as e:
             logger.error(f"触发 forward test 失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/forward_test/accuracy', methods=['GET'])
+    def get_campaign_accuracy_route():
+        """
+        获取 forward test campaign 的准确率
+        ---
+        tags:
+          - Forward Testing
+        summary: Get campaign accuracy
+        description: Returns accuracy metrics for a forward test campaign
+        parameters:
+          - name: version_id
+            in: query
+            type: string
+            required: true
+            description: Version ID
+            example: "2024-01-01-1"
+          - name: symbol
+            in: query
+            type: string
+            required: true
+            description: Trading pair symbol (e.g., BTCUSDT)
+            example: BTCUSDT
+          - name: timeframe
+            in: query
+            type: string
+            required: false
+            default: 15m
+            enum: [5m, 15m, 1h]
+            description: Timeframe for the model
+        responses:
+          200:
+            description: Campaign accuracy metrics
+            schema:
+              type: object
+              properties:
+                version_id:
+                  type: string
+                symbol:
+                  type: string
+                timeframe:
+                  type: string
+                accuracy:
+                  type: number
+                total_runs:
+                  type: integer
+                runs_with_golden:
+                  type: integer
+                matches:
+                  type: integer
+                auto_promoted:
+                  type: boolean
+          404:
+            description: Campaign not found
+          500:
+            description: Server error
+        """
+        try:
+            version_id = request.args.get('version_id')
+            symbol = request.args.get('symbol')
+            timeframe = request.args.get('timeframe', '15m')
+            
+            if not version_id or not symbol:
+                return jsonify({'error': 'Missing required parameters: version_id and symbol'}), 400
+            
+            result = get_campaign_accuracy(version_id, symbol, timeframe)
+            if result is None:
+                return jsonify({'error': 'Campaign not found'}), 404
+            
+            return jsonify(datetime_to_str(result))
+        except Exception as e:
+            logger.error(f"获取 campaign accuracy 失败: {e}", exc_info=True)
             return jsonify({'error': str(e)}), 500
     
     @app.route('/api/forward_test/status', methods=['GET'])

@@ -35,6 +35,8 @@ def _init_forward_test_tables(db_path: str) -> None:
                 created_at TEXT NOT NULL,
                 required_runs INTEGER NOT NULL DEFAULT 5,
                 status TEXT NOT NULL DEFAULT 'active',
+                auto_promoted INTEGER DEFAULT 0,
+                final_accuracy REAL,
                 UNIQUE(version_id, symbol, timeframe)
             );
             CREATE TABLE IF NOT EXISTS forward_test_runs (
@@ -49,6 +51,19 @@ def _init_forward_test_tables(db_path: str) -> None:
             );
         """)
         conn.commit()
+        
+        # Add new columns to existing table if they don't exist (migration)
+        try:
+            conn.execute("ALTER TABLE forward_test_campaigns ADD COLUMN auto_promoted INTEGER DEFAULT 0")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        
+        try:
+            conn.execute("ALTER TABLE forward_test_campaigns ADD COLUMN final_accuracy REAL")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
 
 # --------------- Golden source ---------------
@@ -135,6 +150,194 @@ def _campaign_run_count(conn: sqlite3.Connection, campaign_id: int) -> int:
     return cur.fetchone()[0]
 
 
+def _calculate_campaign_accuracy(conn: sqlite3.Connection, campaign_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Calculate accuracy metrics for a campaign.
+    Returns dict with accuracy, total_runs, runs_with_golden, matches, or None if no runs.
+    """
+    cur = conn.execute(
+        "SELECT match, golden_regime FROM forward_test_runs WHERE campaign_id = ?",
+        (campaign_id,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return None
+    
+    total_runs = len(rows)
+    # Count runs that have golden source data (golden_regime is not None)
+    runs_with_golden = sum(1 for row in rows if row[1] is not None)  # golden_regime is not None
+    # Count matches (match == 1) - only count matches from runs with golden source
+    matches = sum(1 for row in rows if row[1] is not None and row[0] == 1)  # golden_regime is not None and match == 1
+    
+    if runs_with_golden == 0:
+        return {
+            "accuracy": None,
+            "total_runs": total_runs,
+            "runs_with_golden": 0,
+            "matches": 0,
+            "has_sufficient_data": False,
+        }
+    
+    accuracy = matches / runs_with_golden
+    # Consider sufficient if at least 80% of runs have golden source data
+    has_sufficient_data = runs_with_golden >= (total_runs * 0.8)
+    
+    return {
+        "accuracy": accuracy,
+        "total_runs": total_runs,
+        "runs_with_golden": runs_with_golden,
+        "matches": matches,
+        "has_sufficient_data": has_sufficient_data,
+    }
+
+
+def _auto_promote_to_prod_if_qualified(
+    version_id: str,
+    symbol: str,
+    timeframe: str,
+    campaign_id: int,
+    db_path: Optional[str] = None,
+    config: Any = None,
+    accuracy_threshold: float = 0.8,
+    min_data_coverage: float = 0.8,
+) -> bool:
+    """
+    Check if campaign meets auto-promotion criteria and promote to PROD if so.
+    
+    Criteria:
+    - Accuracy >= accuracy_threshold (default 80%)
+    - At least min_data_coverage (default 80%) of runs have golden source data
+    
+    Returns True if promoted, False otherwise.
+    """
+    db_path = db_path or _default_db_path()
+    
+    with _get_conn(db_path) as conn:
+        accuracy_data = _calculate_campaign_accuracy(conn, campaign_id)
+    
+    if accuracy_data is None:
+        logger.debug(f"Campaign {campaign_id} has no runs, cannot calculate accuracy")
+        return False
+    
+    if accuracy_data["accuracy"] is None:
+        logger.debug(f"Campaign {campaign_id} has no golden source data, cannot auto-promote")
+        return False
+    
+    accuracy = accuracy_data["accuracy"]
+    has_sufficient_data = accuracy_data["has_sufficient_data"]
+    
+    # Check if meets criteria
+    if accuracy >= accuracy_threshold and has_sufficient_data:
+        logger.info(
+            f"Campaign {campaign_id} meets auto-promotion criteria: "
+            f"accuracy={accuracy:.2%}, data_coverage={accuracy_data['runs_with_golden']}/{accuracy_data['total_runs']}"
+        )
+        
+        # Import here to avoid circular dependency
+        from model_registry import set_prod
+        
+        # Get models_dir from config
+        if config is None:
+            from config import TrainingConfig
+            config = TrainingConfig
+        models_dir = getattr(config, "MODELS_DIR", None)
+        if models_dir is None:
+            # Fallback to default models directory
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            models_dir = os.path.join(base_dir, "models")
+        
+        # Set PROD
+        success = set_prod(symbol, timeframe, version_id, models_dir=models_dir, db_path=db_path)
+        if success:
+            # Update campaign record to mark as auto-promoted
+            with _get_conn(db_path) as conn:
+                conn.execute(
+                    "UPDATE forward_test_campaigns SET auto_promoted = 1, final_accuracy = ? WHERE id = ?",
+                    (accuracy, campaign_id),
+                )
+                conn.commit()
+            
+            logger.info(
+                f"✅ Auto-promoted {version_id} {symbol} {timeframe} to PROD "
+                f"(accuracy: {accuracy:.2%}, matches: {accuracy_data['matches']}/{accuracy_data['runs_with_golden']})"
+            )
+            return True
+        else:
+            logger.warning(
+                f"Failed to auto-promote {version_id} {symbol} {timeframe} to PROD "
+                f"(model path validation failed)"
+            )
+            return False
+    
+    # Update campaign record with final accuracy even if not promoted
+    with _get_conn(db_path) as conn:
+        conn.execute(
+            "UPDATE forward_test_campaigns SET final_accuracy = ? WHERE id = ?",
+            (accuracy, campaign_id),
+        )
+        conn.commit()
+    
+    logger.debug(
+        f"Campaign {campaign_id} does not meet auto-promotion criteria: "
+        f"accuracy={accuracy:.2%} (need >= {accuracy_threshold:.2%}), "
+        f"data_coverage={accuracy_data['runs_with_golden']}/{accuracy_data['total_runs']} "
+        f"(need >= {min_data_coverage:.2%})"
+    )
+    return False
+
+
+def get_campaign_accuracy(
+    version_id: str,
+    symbol: str,
+    timeframe: str,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Get accuracy metrics for a forward test campaign.
+    Returns dict with accuracy, total_runs, runs_with_golden, matches, etc., or None if campaign not found.
+    """
+    db_path = db_path or _default_db_path()
+    if not os.path.isfile(db_path):
+        return None
+    
+    _init_forward_test_tables(db_path)
+    
+    with _get_conn(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT id FROM forward_test_campaigns WHERE version_id = ? AND symbol = ? AND timeframe = ?",
+            (version_id, symbol, timeframe),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        campaign_id = row["id"]
+        
+        accuracy_data = _calculate_campaign_accuracy(conn, campaign_id)
+        if accuracy_data is None:
+            return None
+        
+        # Get campaign status info
+        cur = conn.execute(
+            "SELECT status, auto_promoted, final_accuracy FROM forward_test_campaigns WHERE id = ?",
+            (campaign_id,),
+        )
+        campaign_row = cur.fetchone()
+        
+        result = {
+            "version_id": version_id,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "campaign_id": campaign_id,
+            "status": campaign_row["status"] if campaign_row else None,
+            "auto_promoted": bool(campaign_row["auto_promoted"]) if campaign_row and campaign_row["auto_promoted"] is not None else False,
+            "final_accuracy": campaign_row["final_accuracy"] if campaign_row and campaign_row["final_accuracy"] is not None else None,
+            **accuracy_data,
+        }
+        
+        return result
+
+
 def run_one_forward_test(
     version_id: str,
     symbol: str,
@@ -205,6 +408,7 @@ def run_one_forward_test(
             conn.execute("UPDATE forward_test_campaigns SET status = 'qualified' WHERE id = ?", (campaign_id,))
             conn.commit()
             logger.info(f"Forward test campaign {campaign_id} qualified ({new_count} runs)")
+            
             # Notify cron manager to cancel job (if using cron manager)
             try:
                 cron_mgr = ForwardTestCronManager._instance
@@ -212,6 +416,19 @@ def run_one_forward_test(
                     cron_mgr.cancel_campaign_job(version_id, symbol, timeframe)
             except Exception:
                 pass  # Cron manager may not be initialized
+            
+            # Auto-promote to PROD if accuracy threshold met
+            try:
+                auto_promoted = _auto_promote_to_prod_if_qualified(
+                    version_id, symbol, timeframe, campaign_id,
+                    db_path=db_path, config=config,
+                    accuracy_threshold=0.8,  # 80% accuracy required
+                    min_data_coverage=0.8,  # 80% of runs must have golden source
+                )
+                if auto_promoted:
+                    logger.info(f"✅ Model {version_id} {symbol} {timeframe} auto-promoted to PROD")
+            except Exception as e:
+                logger.warning(f"Auto-promotion hook failed (campaign still qualified): {e}", exc_info=True)
 
     return {
         "campaign_id": campaign_id,
@@ -443,7 +660,7 @@ class ForwardTestCronManager:
     
     def register_campaign_job(self, version_id: str, symbol: str, timeframe: str) -> bool:
         """
-        Register a cron job for a campaign. Returns True if registered, False if already exists.
+        Register a cron job for a campaign. Returns True if registered, False if already exists or invalid timeframe.
         """
         key = self._get_campaign_key(version_id, symbol, timeframe)
         if key in self._jobs:
@@ -455,7 +672,7 @@ class ForwardTestCronManager:
             logger.warning(f"Unknown timeframe {timeframe}, cannot register cron job")
             return False
         
-        # Ensure scheduler is running before registering jobs
+        # Ensure scheduler is running before registering jobs (only if timeframe is valid)
         if not self._is_running:
             logger.warning(f"Cron manager not running, starting it before registering job for {version_id} {symbol} {timeframe}")
             self.start()
@@ -491,10 +708,18 @@ class ForwardTestCronManager:
                 if tick_count % 60 == 0:
                     pending_jobs = len([j for j in schedule.jobs if j.should_run])
                     logger.debug(f"Cron scheduler alive: {len(self._jobs)} registered jobs, {pending_jobs} pending")
-                time.sleep(1)  # Check every second
+                # Sleep in small increments to check _is_running more frequently
+                for _ in range(10):  # Sleep 0.1s at a time, total 1s
+                    if not self._is_running:
+                        break
+                    time.sleep(0.1)
             except Exception as e:
                 logger.error(f"Cron scheduler loop error: {e}", exc_info=True)
-                time.sleep(1)
+                # On error, also check flag frequently
+                for _ in range(10):
+                    if not self._is_running:
+                        break
+                    time.sleep(0.1)
         logger.info("Forward test cron scheduler thread stopped")
     
     def start(self) -> None:
@@ -514,8 +739,16 @@ class ForwardTestCronManager:
         self._is_running = False
         # Cancel all jobs
         for key in list(self._jobs.keys()):
-            schedule.cancel_job(self._jobs[key])
+            try:
+                schedule.cancel_job(self._jobs[key])
+            except Exception:
+                pass  # Job might already be cancelled
         self._jobs.clear()
+        # Clear all schedule jobs to prevent interference
+        try:
+            schedule.clear()
+        except Exception:
+            pass  # schedule.clear() might fail in some versions
         logger.info("Forward test cron manager stopped")
     
     def sync_jobs_from_db(self) -> None:
