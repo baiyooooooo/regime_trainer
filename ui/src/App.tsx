@@ -5,6 +5,7 @@ import Predictions from './pages/Predictions'
 import Models from './pages/Models'
 import ForwardTesting from './pages/ForwardTesting'
 import History from './pages/History'
+import ConfigManagement from './pages/ConfigManagement'
 
 function App() {
   return (
@@ -16,6 +17,7 @@ function App() {
           <Route path="/models" element={<Models />} />
           <Route path="/forward-testing" element={<ForwardTesting />} />
           <Route path="/history" element={<History />} />
+          <Route path="/configs" element={<ConfigManagement />} />
         </Routes>
       </Layout>
     </Router>

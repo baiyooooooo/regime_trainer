@@ -10,7 +10,7 @@
 import logging
 import os
 from datetime import datetime
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import pandas as pd
 import numpy as np
 
@@ -21,6 +21,10 @@ from hmm_trainer import HMMRegimeLabeler
 from lstm_trainer import LSTMRegimeClassifier
 from model_registry import allocate_version_id, register_version
 from forward_testing import on_training_finished as forward_test_on_training_finished, ForwardTestCronManager
+from config_registry import (
+    get_config_or_default, config_dict_to_object, link_model_to_config,
+    get_default_config
+)
 
 setup_logging(log_file='training.log', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,11 +32,130 @@ logger = logging.getLogger(__name__)
 class TrainingPipeline:
     """训练管道"""
     
-    def __init__(self, config: TrainingConfig):
-        self.config = config
+    def __init__(self, config: TrainingConfig = None, config_version_id: Optional[str] = None):
+        """
+        Initialize training pipeline.
+        
+        Args:
+            config: TrainingConfig object (optional, for backward compatibility)
+            config_version_id: Config version ID from database (optional)
+        
+        If config_version_id is provided, loads config from database.
+        If config is provided, uses it directly.
+        If neither provided, uses TrainingConfig defaults.
+        """
+        if config_version_id is not None:
+            # Load config from database
+            config_dict = get_config_or_default(config_version_id)
+            config_obj = config_dict_to_object(config_dict)
+            # Copy attributes to make it work like TrainingConfig
+            self.config = type('Config', (), {})()
+            for attr_name in dir(config_obj):
+                if not attr_name.startswith('_'):
+                    setattr(self.config, attr_name, getattr(config_obj, attr_name))
+            # Ensure required attributes exist
+            if not hasattr(self.config, 'BINANCE_API_KEY'):
+                self.config.BINANCE_API_KEY = getattr(TrainingConfig, 'BINANCE_API_KEY', '')
+            if not hasattr(self.config, 'BINANCE_API_SECRET'):
+                self.config.BINANCE_API_SECRET = getattr(TrainingConfig, 'BINANCE_API_SECRET', '')
+            if not hasattr(self.config, 'MODELS_DIR'):
+                self.config.MODELS_DIR = TrainingConfig.MODELS_DIR
+            if not hasattr(self.config, 'DATA_DIR'):
+                self.config.DATA_DIR = TrainingConfig.DATA_DIR
+            if not hasattr(self.config, 'PRIMARY_TIMEFRAME'):
+                self.config.PRIMARY_TIMEFRAME = getattr(TrainingConfig, 'PRIMARY_TIMEFRAME', '15m')
+            # Copy class methods from TrainingConfig, but use instance attributes
+            def get_version_dir(version_id: str) -> str:
+                return os.path.join(self.config.MODELS_DIR, version_id)
+            
+            def get_model_path_for_version(version_id: str, symbol: str, model_type: str = "lstm", primary_timeframe: str = None) -> str:
+                tf = primary_timeframe or self.config.PRIMARY_TIMEFRAME
+                ext = "h5" if model_type == "lstm" else "pkl"
+                fname = f"{model_type}_model.{ext}"
+                return os.path.join(self.config.MODELS_DIR, version_id, symbol, tf, fname)
+            
+            def get_scaler_path_for_version(version_id: str, symbol: str, primary_timeframe: str = None) -> str:
+                tf = primary_timeframe or self.config.PRIMARY_TIMEFRAME
+                return os.path.join(self.config.MODELS_DIR, version_id, symbol, tf, "scaler.pkl")
+            
+            def get_hmm_path_for_version(version_id: str, symbol: str, primary_timeframe: str = None) -> str:
+                tf = primary_timeframe or self.config.PRIMARY_TIMEFRAME
+                return os.path.join(self.config.MODELS_DIR, version_id, symbol, tf, "hmm_model.pkl")
+            
+            def get_prod_model_path(symbol: str, model_type: str = "lstm", primary_timeframe: str = None) -> str:
+                from model_registry import get_prod_version
+                tf = primary_timeframe or self.config.PRIMARY_TIMEFRAME
+                version_id = get_prod_version(symbol, tf, models_dir=self.config.MODELS_DIR)
+                if version_id:
+                    return get_model_path_for_version(version_id, symbol, model_type, tf)
+                return get_model_path(symbol, model_type, tf)
+            
+            def get_prod_scaler_path(symbol: str, primary_timeframe: str = None) -> str:
+                from model_registry import get_prod_version
+                tf = primary_timeframe or self.config.PRIMARY_TIMEFRAME
+                version_id = get_prod_version(symbol, tf, models_dir=self.config.MODELS_DIR)
+                if version_id:
+                    return get_scaler_path_for_version(version_id, symbol, tf)
+                return get_scaler_path(symbol, tf)
+            
+            def get_prod_hmm_path(symbol: str, primary_timeframe: str = None) -> str:
+                from model_registry import get_prod_version
+                tf = primary_timeframe or self.config.PRIMARY_TIMEFRAME
+                version_id = get_prod_version(symbol, tf, models_dir=self.config.MODELS_DIR)
+                if version_id:
+                    return get_hmm_path_for_version(version_id, symbol, tf)
+                return get_hmm_path(symbol, tf)
+            
+            def get_model_path(symbol: str, model_type: str = "lstm", primary_timeframe: str = None) -> str:
+                tf = primary_timeframe or self.config.PRIMARY_TIMEFRAME
+                ext = "h5" if model_type == "lstm" else "pkl"
+                fname = f"{model_type}_model.{ext}"
+                return os.path.join(self.config.MODELS_DIR, symbol, tf, fname)
+            
+            def get_scaler_path(symbol: str, primary_timeframe: str = None) -> str:
+                tf = primary_timeframe or self.config.PRIMARY_TIMEFRAME
+                return os.path.join(self.config.MODELS_DIR, symbol, tf, "scaler.pkl")
+            
+            def get_hmm_path(symbol: str, primary_timeframe: str = None) -> str:
+                tf = primary_timeframe or self.config.PRIMARY_TIMEFRAME
+                return os.path.join(self.config.MODELS_DIR, symbol, tf, "hmm_model.pkl")
+            
+            def get_model_config(primary_timeframe: str) -> dict:
+                if not hasattr(self.config, 'MODEL_CONFIGS') or primary_timeframe not in self.config.MODEL_CONFIGS:
+                    # Fallback to TrainingConfig if not in instance
+                    return TrainingConfig.get_model_config(primary_timeframe)
+                return self.config.MODEL_CONFIGS[primary_timeframe]
+            
+            def ensure_dirs():
+                for directory in [self.config.DATA_DIR, self.config.MODELS_DIR, getattr(self.config, 'LOGS_DIR', TrainingConfig.LOGS_DIR)]:
+                    os.makedirs(directory, exist_ok=True)
+            
+            # Bind methods to config object
+            self.config.get_version_dir = get_version_dir
+            self.config.get_model_path_for_version = get_model_path_for_version
+            self.config.get_scaler_path_for_version = get_scaler_path_for_version
+            self.config.get_hmm_path_for_version = get_hmm_path_for_version
+            self.config.get_prod_model_path = get_prod_model_path
+            self.config.get_prod_scaler_path = get_prod_scaler_path
+            self.config.get_prod_hmm_path = get_prod_hmm_path
+            self.config.get_model_path = get_model_path
+            self.config.get_scaler_path = get_scaler_path
+            self.config.get_hmm_path = get_hmm_path
+            self.config.get_model_config = get_model_config
+            self.config.ensure_dirs = ensure_dirs
+            self.config_version_id = config_version_id
+        elif config is not None:
+            # Use provided config (backward compatible)
+            self.config = config
+            self.config_version_id = None
+        else:
+            # Use defaults
+            self.config = TrainingConfig
+            self.config_version_id = None
+        
         self.data_fetcher = BinanceDataFetcher(
-            api_key=config.BINANCE_API_KEY,
-            api_secret=config.BINANCE_API_SECRET
+            api_key=self.config.BINANCE_API_KEY,
+            api_secret=self.config.BINANCE_API_SECRET
         )
         self.feature_engineer = FeatureEngineer(cache_manager=self.data_fetcher.cache_manager)
     
@@ -491,6 +614,21 @@ class TrainingPipeline:
         lstm_classifier.save(model_path, scaler_path)
         
         register_version(version_id, db_path=os.path.join(self.config.DATA_DIR, "model_registry.db"))
+        
+        # Link model to config version if config_version_id was used
+        if hasattr(self, 'config_version_id') and self.config_version_id:
+            try:
+                link_model_to_config(
+                    version_id,
+                    self.config_version_id,
+                    symbol,
+                    primary_timeframe,
+                    db_path=os.path.join(self.config.DATA_DIR, "model_registry.db")
+                )
+                logger.info(f"Linked model {version_id} to config {self.config_version_id}")
+            except Exception as e:
+                logger.warning(f"Failed to link model to config (training result unchanged): {e}")
+        
         try:
             cron_mgr = ForwardTestCronManager._instance
             forward_test_on_training_finished(symbol, primary_timeframe, version_id, self.config, cron_manager=cron_mgr)
@@ -714,6 +852,21 @@ class TrainingPipeline:
         lstm_classifier.save(model_path, scaler_path)
         
         register_version(version_id, db_path=os.path.join(self.config.DATA_DIR, "model_registry.db"))
+        
+        # Link model to config version if config_version_id was used
+        if hasattr(self, 'config_version_id') and self.config_version_id:
+            try:
+                link_model_to_config(
+                    version_id,
+                    self.config_version_id,
+                    symbol,
+                    primary_timeframe,
+                    db_path=os.path.join(self.config.DATA_DIR, "model_registry.db")
+                )
+                logger.info(f"Linked model {version_id} to config {self.config_version_id}")
+            except Exception as e:
+                logger.warning(f"Failed to link model to config (training result unchanged): {e}")
+        
         try:
             cron_mgr = ForwardTestCronManager._instance
             forward_test_on_training_finished(symbol, primary_timeframe, version_id, self.config, cron_manager=cron_mgr)

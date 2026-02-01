@@ -77,6 +77,25 @@ export interface HistoryData {
   }>
 }
 
+export interface ConfigVersion {
+  config_version_id: string
+  created_at: string
+  description: string | null
+  is_active: boolean
+  model_count: number
+}
+
+export interface ConfigData {
+  [key: string]: any
+}
+
+export interface ModelConfigLink {
+  model_version_id: string
+  symbol: string
+  timeframe: string
+  created_at: string
+}
+
 // API Services
 export const healthCheck = async () => {
   const response = await apiClient.get('/health')
@@ -177,5 +196,91 @@ export const getHistory = async (
   const response = await apiClient.get<HistoryData>(`/history/${symbol}`, {
     params: { timeframe, ...options },
   })
+  return response.data
+}
+
+// Config Management API
+export const listConfigVersions = async (includeInactive: boolean = false) => {
+  const response = await apiClient.get<{ configs: ConfigVersion[]; total: number }>('/configs', {
+    params: { include_inactive: includeInactive },
+  })
+  return response.data
+}
+
+export const getConfigVersion = async (configVersionId: string) => {
+  const response = await apiClient.get<ConfigData>(`/configs/${configVersionId}`)
+  return response.data
+}
+
+export const getDefaultConfig = async () => {
+  const response = await apiClient.get<ConfigData>('/configs/defaults')
+  return response.data
+}
+
+export const initConfigFromFile = async (description?: string) => {
+  const response = await apiClient.post<{ config_version_id: string; message: string }>(
+    '/configs/init',
+    { description }
+  )
+  return response.data
+}
+
+export const createConfigVersion = async (config: ConfigData, description?: string) => {
+  const response = await apiClient.post<{ config_version_id: string; message: string }>(
+    '/configs',
+    { config, description }
+  )
+  return response.data
+}
+
+export const updateConfigVersion = async (
+  configVersionId: string,
+  updates: ConfigData,
+  description?: string
+) => {
+  const response = await apiClient.put<{ config_version_id: string; message: string }>(
+    `/configs/${configVersionId}`,
+    { updates, description }
+  )
+  return response.data
+}
+
+export const deleteConfigVersion = async (configVersionId: string) => {
+  const response = await apiClient.delete<{ message: string }>(`/configs/${configVersionId}`)
+  return response.data
+}
+
+export const getModelsForConfig = async (configVersionId: string) => {
+  const response = await apiClient.get<{ models: ModelConfigLink[] }>(
+    `/configs/${configVersionId}/models`
+  )
+  return response.data
+}
+
+export const getModelConfig = async (
+  modelVersionId: string,
+  symbol: string,
+  timeframe: string
+) => {
+  const response = await apiClient.get<{ config_version_id: string; config: ConfigData }>(
+    `/models/${modelVersionId}/config`,
+    { params: { symbol, timeframe } }
+  )
+  return response.data
+}
+
+// Training API
+export const triggerTraining = async (params: {
+  symbol: string
+  timeframe: string
+  training_type: 'full' | 'incremental'
+  config_version_id?: string
+}) => {
+  const response = await apiClient.post<{
+    job_id: string
+    message: string
+    status: string
+    config_version_id: string | null
+  }>('/training/train', params)
   return response.data
 }

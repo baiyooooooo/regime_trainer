@@ -5,7 +5,8 @@ import {
   TrendingUp, 
   Database, 
   TestTube, 
-  History as HistoryIcon 
+  History as HistoryIcon,
+  Settings
 } from 'lucide-react'
 
 interface LayoutProps {
@@ -14,9 +15,10 @@ interface LayoutProps {
 
 const navItems = [
   { path: '/', label: 'Dashboard', icon: LayoutDashboard },
-  { path: '/predictions', label: 'Predictions', icon: TrendingUp },
-  { path: '/models', label: 'Models', icon: Database },
+  { path: '/configs', label: 'Config Management', icon: Settings },
+  { path: '/models', label: 'Model Management', icon: Database },
   { path: '/forward-testing', label: 'Forward Testing', icon: TestTube },
+  { path: '/predictions', label: 'Predictions', icon: TrendingUp },
   { path: '/history', label: 'History', icon: HistoryIcon },
 ]
 

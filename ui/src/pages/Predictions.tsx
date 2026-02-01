@@ -167,7 +167,7 @@ export default function Predictions() {
             <div>
               <p className="text-slate-400 mb-2">All Regimes</p>
               <div className="space-y-2">
-                {prediction.all_regimes.map((regime, idx) => (
+                {(prediction.all_regimes || []).map((regime, idx) => (
                   <div key={idx} className="bg-slate-700 p-3 rounded-lg flex justify-between">
                     <span className="text-white">{regime.name}</span>
                     <span className="text-slate-400">
@@ -185,21 +185,29 @@ export default function Predictions() {
         <div className="card">
           <h2 className="text-xl font-semibold text-white mb-4">Multi-Step Predictions</h2>
           <div className="space-y-4">
-            {multiStep.predictions.map((pred, idx) => (
-              <div key={idx} className="bg-slate-700 p-4 rounded-lg">
-                <h3 className="text-lg font-medium text-white mb-2">Step {pred.step}</h3>
-                <div className="space-y-2">
-                  {pred.regimes.map((regime, rIdx) => (
-                    <div key={rIdx} className="flex justify-between">
-                      <span className="text-slate-300">{regime.name}</span>
-                      <span className="text-slate-400">
-                        {(regime.probability * 100).toFixed(2)}%
-                      </span>
-                    </div>
-                  ))}
+            {Array.isArray(multiStep.predictions) ? (
+              multiStep.predictions.map((pred, idx) => (
+                <div key={idx} className="bg-slate-700 p-4 rounded-lg">
+                  <h3 className="text-lg font-medium text-white mb-2">Step {pred.step}</h3>
+                  <div className="space-y-2">
+                    {Array.isArray(pred.regimes) ? (
+                      pred.regimes.map((regime, rIdx) => (
+                        <div key={rIdx} className="flex justify-between">
+                          <span className="text-slate-300">{regime.name}</span>
+                          <span className="text-slate-400">
+                            {(regime.probability * 100).toFixed(2)}%
+                          </span>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="text-slate-400">No regime data available</p>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))}
+              ))
+            ) : (
+              <p className="text-slate-400">No predictions available</p>
+            )}
           </div>
         </div>
       )}

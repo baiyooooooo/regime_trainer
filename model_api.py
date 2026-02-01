@@ -11,6 +11,7 @@
 """
 import logging
 import os
+import json
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import pandas as pd
@@ -20,6 +21,13 @@ from config import TrainingConfig, setup_logging
 from realtime_predictor import RealtimeRegimePredictor, MultiTimeframeRegimePredictor
 from model_registry import get_prod_info, set_prod, list_versions
 from forward_testing import trigger_all_pending_forward_tests, ForwardTestCronManager, get_campaign_accuracy
+from config_registry import (
+    init_from_config_file, create_config_version, get_config_version,
+    list_config_versions, update_config_version, delete_config_version,
+    get_config_for_model, get_models_for_config, get_config_or_default,
+    config_dict_to_object, get_default_config
+)
+from training_pipeline import TrainingPipeline
 
 setup_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -854,6 +862,8 @@ def create_app(api_instance: ModelAPI = None):
             {"name": "Models", "description": "Model management endpoints"},
             {"name": "Forward Testing", "description": "Forward testing endpoints"},
             {"name": "History", "description": "Historical data endpoints"},
+            {"name": "Config", "description": "Training configuration management endpoints"},
+            {"name": "Training", "description": "Model training endpoints"},
         ]
     }
     
@@ -955,6 +965,12 @@ def create_app(api_instance: ModelAPI = None):
             if timeframe not in api.config.MODEL_CONFIGS.keys():
                 return jsonify({'error': f'不支持的时间框架: {timeframe}，支持的值: {list(api.config.MODEL_CONFIGS.keys())}'}), 400
             result = api.predict_next_regime(symbol, primary_timeframe=timeframe)
+            # Transform regime_probabilities dict to all_regimes array for frontend compatibility
+            if 'regime_probabilities' in result and 'all_regimes' not in result:
+                result['all_regimes'] = [
+                    {'name': name, 'probability': prob}
+                    for name, prob in result['regime_probabilities'].items()
+                ]
             return jsonify(datetime_to_str(result))
         except ValueError as e:
             return jsonify({'error': str(e)}), 404
@@ -1022,6 +1038,42 @@ def create_app(api_instance: ModelAPI = None):
             if timeframe not in api.config.MODEL_CONFIGS.keys():
                 return jsonify({'error': f'不支持的时间框架: {timeframe}，支持的值: {list(api.config.MODEL_CONFIGS.keys())}'}), 400
             result = api.predict_regimes(symbol, primary_timeframe=timeframe, include_history=include_history)
+            
+            # Transform predictions object to array format for frontend compatibility
+            if 'predictions' in result and isinstance(result['predictions'], dict):
+                predictions_array = []
+                for horizon, pred_data in result['predictions'].items():
+                    # Extract step number from horizon (e.g., 't+1' -> 1)
+                    step_num = int(horizon.split('+')[1]) if '+' in horizon else 1
+                    # Convert probabilities dict to regimes array
+                    regimes = [
+                        {'name': name, 'probability': prob}
+                        for name, prob in pred_data.get('probabilities', {}).items()
+                    ]
+                    predictions_array.append({
+                        'step': step_num,
+                        'horizon': horizon,
+                        'regimes': regimes,
+                        'most_likely': pred_data.get('most_likely'),
+                        'confidence': pred_data.get('confidence'),
+                        'is_uncertain': pred_data.get('is_uncertain', False)
+                    })
+                # Sort by step number
+                predictions_array.sort(key=lambda x: x['step'])
+                result['predictions'] = predictions_array
+            
+            # Transform history if present
+            if 'historical_regimes' in result and isinstance(result['historical_regimes'], dict):
+                hist = result['historical_regimes']
+                if 'sequence' in hist:
+                    result['history'] = [
+                        {
+                            'timestamp': hist.get('timestamps', [])[i] if i < len(hist.get('timestamps', [])) else None,
+                            'regime': regime
+                        }
+                        for i, regime in enumerate(hist.get('sequence', []))
+                    ]
+            
             return jsonify(datetime_to_str(result))
         except ValueError as e:
             return jsonify({'error': str(e)}), 404
@@ -1199,6 +1251,9 @@ def create_app(api_instance: ModelAPI = None):
                   format: date-time
                 note:
                   type: string
+                config_version_id:
+                  type: string
+                  description: Config version ID used to train this PROD model (if available)
           400:
             description: Missing symbol or invalid timeframe
           500:
@@ -1216,13 +1271,23 @@ def create_app(api_instance: ModelAPI = None):
                 # 无显式 PROD 指针时返回当前生效的版本（latest 或 legacy）
                 from model_registry import get_prod_version
                 version_id = get_prod_version(symbol, timeframe, models_dir=api.config.MODELS_DIR)
-                return jsonify({
+                result = {
                     'symbol': symbol,
                     'timeframe': timeframe,
                     'version_id': version_id,
                     'updated_at': None,
                     'note': 'fallback (no prod_pointer row)'
-                })
+                }
+                # Add config version if available
+                if version_id:
+                    config_info = get_config_for_model(version_id, symbol, timeframe)
+                    if config_info:
+                        result['config_version_id'] = config_info.get('config_version_id')
+                return jsonify(result)
+            # Add config version to PROD info
+            config_info = get_config_for_model(info['version_id'], symbol, timeframe)
+            if config_info:
+                info['config_version_id'] = config_info.get('config_version_id')
             return jsonify(info)
         except Exception as e:
             logger.error(f"获取 PROD 失败: {e}", exc_info=True)
@@ -1301,12 +1366,12 @@ def create_app(api_instance: ModelAPI = None):
     @app.route('/api/models/versions', methods=['GET'])
     def list_versions_route():
         """
-        列出所有版本及每个版本包含的 symbol/timeframe；标注 is_prod
+        列出所有版本及每个版本包含的 symbol/timeframe；标注 is_prod 和 config_version_id
         ---
         tags:
           - Models
         summary: List all model versions
-        description: Returns all registered model versions with their contents (symbols/timeframes) and production status
+        description: Returns all registered model versions with their contents (symbols/timeframes), production status, and config version used for training
         responses:
           200:
             description: List of all versions
@@ -1334,6 +1399,9 @@ def create_app(api_instance: ModelAPI = None):
                               type: string
                             is_prod:
                               type: boolean
+                            config_version_id:
+                              type: string
+                              description: Config version ID used to train this model (if available)
           500:
             description: Server error
         """
@@ -1537,6 +1605,588 @@ def create_app(api_instance: ModelAPI = None):
             })
         except Exception as e:
             logger.error(f"获取 forward test 状态失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    # ============ Config Management Endpoints ============
+    
+    @app.route('/api/configs', methods=['GET'])
+    def list_configs():
+        """
+        列出所有配置版本
+        ---
+        tags:
+          - Config
+        summary: List all config versions
+        description: Returns a list of all training config versions
+        parameters:
+          - name: include_inactive
+            in: query
+            type: boolean
+            required: false
+            default: false
+            description: Include inactive (deleted) configs
+          - name: limit
+            in: query
+            type: integer
+            required: false
+            default: 50
+            description: Maximum number of configs to return
+          - name: offset
+            in: query
+            type: integer
+            required: false
+            default: 0
+            description: Number of configs to skip
+        responses:
+          200:
+            description: List of config versions
+            schema:
+              type: object
+              properties:
+                configs:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      config_version_id:
+                        type: string
+                      created_at:
+                        type: string
+                      description:
+                        type: string
+                      is_active:
+                        type: boolean
+                      model_count:
+                        type: integer
+                total:
+                  type: integer
+        """
+        try:
+            include_inactive = request.args.get('include_inactive', 'false').lower() == 'true'
+            limit = int(request.args.get('limit', 50))
+            offset = int(request.args.get('offset', 0))
+            
+            configs = list_config_versions(include_inactive=include_inactive)
+            total = len(configs)
+            configs = configs[offset:offset + limit]
+            
+            return jsonify({
+                'configs': configs,
+                'total': total
+            })
+        except Exception as e:
+            logger.error(f"列出配置版本失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/configs/defaults', methods=['GET'])
+    def get_default_config_endpoint():
+        """
+        获取默认配置值
+        ---
+        tags:
+          - Config
+        summary: Get default config values from TrainingConfig
+        description: Returns the default config values from TrainingConfig class without creating a version
+        responses:
+          200:
+            description: Default config values
+            schema:
+              type: object
+              additionalProperties:
+                type: string
+        """
+        try:
+            default_config = get_default_config()
+            # Parse JSON values back to Python objects for response
+            parsed_config = {}
+            for key, value_json in default_config.items():
+                try:
+                    parsed_config[key] = json.loads(value_json)
+                except (json.JSONDecodeError, TypeError):
+                    parsed_config[key] = value_json
+            return jsonify(parsed_config)
+        except Exception as e:
+            logger.error(f"获取默认配置失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/configs/<config_version_id>', methods=['GET'])
+    def get_config(config_version_id):
+        """
+        获取特定配置版本
+        ---
+        tags:
+          - Config
+        summary: Get specific config version
+        description: Returns the full configuration for a specific version
+        parameters:
+          - name: config_version_id
+            in: path
+            type: string
+            required: true
+            description: Config version ID
+        responses:
+          200:
+            description: Config version data
+            schema:
+              type: object
+              additionalProperties:
+                type: string
+          404:
+            description: Config version not found
+        """
+        try:
+            config_dict = get_config_version(config_version_id)
+            if config_dict is None:
+                return jsonify({'error': f'Config version {config_version_id} not found'}), 404
+            
+            # Parse JSON values back to Python objects for response
+            parsed_config = {}
+            for key, value_json in config_dict.items():
+                try:
+                    parsed_config[key] = json.loads(value_json)
+                except (json.JSONDecodeError, TypeError):
+                    parsed_config[key] = value_json
+            
+            return jsonify(parsed_config)
+        except Exception as e:
+            logger.error(f"获取配置版本失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/configs/init', methods=['POST'])
+    def init_config():
+        """
+        初始化/迁移配置
+        ---
+        tags:
+          - Config
+        summary: Initialize config from TrainingConfig file
+        description: Imports current TrainingConfig class values into database as a new version. Always creates a new version.
+        parameters:
+          - name: body
+            in: body
+            required: false
+            schema:
+              type: object
+              properties:
+                description:
+                  type: string
+                  description: Description for the config version
+                  default: "Initial config from TrainingConfig"
+        responses:
+          201:
+            description: Config initialized (new version created)
+            schema:
+              type: object
+              properties:
+                config_version_id:
+                  type: string
+                message:
+                  type: string
+          400:
+            description: Invalid request
+        """
+        try:
+            data = request.get_json() or {}
+            description = data.get('description', 'Initial config from TrainingConfig')
+            
+            config_version_id = init_from_config_file(description=description)
+            
+            return jsonify({
+                'config_version_id': config_version_id,
+                'message': f'Config initialized: {config_version_id}'
+            }), 201
+        except Exception as e:
+            logger.error(f"初始化配置失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/configs', methods=['POST'])
+    def create_config():
+        """
+        创建新配置版本
+        ---
+        tags:
+          - Config
+        summary: Create new config version
+        description: Creates a new config version from provided config dict
+        parameters:
+          - name: body
+            in: body
+            required: true
+            schema:
+              type: object
+              required:
+                - config
+              properties:
+                config:
+                  type: object
+                  description: Config dictionary (can be nested or flattened)
+                description:
+                  type: string
+                  description: Optional description
+        responses:
+          201:
+            description: Config version created
+            schema:
+              type: object
+              properties:
+                config_version_id:
+                  type: string
+                message:
+                  type: string
+          400:
+            description: Invalid request
+        """
+        try:
+            data = request.get_json()
+            if not data or 'config' not in data:
+                return jsonify({'error': 'Missing required field: config'}), 400
+            
+            config_dict = data['config']
+            description = data.get('description')
+            
+            config_version_id = create_config_version(config_dict, description=description)
+            
+            return jsonify({
+                'config_version_id': config_version_id,
+                'message': f'Config version created: {config_version_id}'
+            }), 201
+        except Exception as e:
+            logger.error(f"创建配置版本失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/configs/<config_version_id>', methods=['PUT'])
+    def update_config(config_version_id):
+        """
+        更新配置版本（创建新版本）
+        ---
+        tags:
+          - Config
+        summary: Update config version (creates new version)
+        description: Creates a new config version with updates from the specified version
+        parameters:
+          - name: config_version_id
+            in: path
+            type: string
+            required: true
+            description: Source config version ID
+          - name: body
+            in: body
+            required: true
+            schema:
+              type: object
+              required:
+                - updates
+              properties:
+                updates:
+                  type: object
+                  description: Dict of updates (can be nested or flattened)
+                description:
+                  type: string
+                  description: Optional description for new version
+        responses:
+          201:
+            description: New config version created
+            schema:
+              type: object
+              properties:
+                config_version_id:
+                  type: string
+                message:
+                  type: string
+          404:
+            description: Source config version not found
+        """
+        try:
+            data = request.get_json()
+            if not data or 'updates' not in data:
+                return jsonify({'error': 'Missing required field: updates'}), 400
+            
+            updates_dict = data['updates']
+            description = data.get('description')
+            
+            new_config_version_id = update_config_version(
+                config_version_id,
+                updates_dict,
+                description=description
+            )
+            
+            return jsonify({
+                'config_version_id': new_config_version_id,
+                'message': f'New config version created: {new_config_version_id} (from {config_version_id})'
+            }), 201
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 404
+        except Exception as e:
+            logger.error(f"更新配置版本失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/configs/<config_version_id>', methods=['DELETE'])
+    def delete_config(config_version_id):
+        """
+        删除配置版本（软删除）
+        ---
+        tags:
+          - Config
+        summary: Delete config version (soft delete)
+        description: Soft deletes a config version by setting is_active=0
+        parameters:
+          - name: config_version_id
+            in: path
+            type: string
+            required: true
+            description: Config version ID to delete
+        responses:
+          200:
+            description: Config version deleted
+            schema:
+              type: object
+              properties:
+                message:
+                  type: string
+          404:
+            description: Config version not found
+        """
+        try:
+            success = delete_config_version(config_version_id)
+            if not success:
+                return jsonify({'error': f'Config version {config_version_id} not found'}), 404
+            
+            return jsonify({
+                'message': f'Config version {config_version_id} deleted'
+            })
+        except Exception as e:
+            logger.error(f"删除配置版本失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/configs/<config_version_id>/models', methods=['GET'])
+    def get_models_for_config_endpoint(config_version_id):
+        """
+        获取使用指定配置训练的模型列表
+        ---
+        tags:
+          - Config
+        summary: List models trained with config version
+        description: Returns all models that were trained using the specified config version
+        parameters:
+          - name: config_version_id
+            in: path
+            type: string
+            required: true
+            description: Config version ID
+        responses:
+          200:
+            description: List of models
+            schema:
+              type: object
+              properties:
+                models:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      model_version_id:
+                        type: string
+                      symbol:
+                        type: string
+                      timeframe:
+                        type: string
+                      created_at:
+                        type: string
+        """
+        try:
+            models = get_models_for_config(config_version_id)
+            return jsonify({'models': models})
+        except Exception as e:
+            logger.error(f"获取配置关联的模型失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    # ============ Training Endpoints ============
+    
+    @app.route('/api/training/train', methods=['POST'])
+    def trigger_training():
+        """
+        触发模型训练
+        ---
+        tags:
+          - Training
+        summary: Trigger model training with config version
+        description: Triggers model training for a symbol/timeframe using a specific config version
+        parameters:
+          - name: body
+            in: body
+            required: true
+            schema:
+              type: object
+              required:
+                - symbol
+                - timeframe
+                - training_type
+              properties:
+                symbol:
+                  type: string
+                  description: Trading pair symbol
+                  example: BTCUSDT
+                timeframe:
+                  type: string
+                  description: Primary timeframe
+                  enum: [5m, 15m, 1h]
+                  example: 15m
+                config_version_id:
+                  type: string
+                  description: Config version ID (optional, uses defaults if not provided)
+                training_type:
+                  type: string
+                  enum: [full, incremental]
+                  description: Training type
+                  example: full
+        responses:
+          200:
+            description: Training started
+            schema:
+              type: object
+              properties:
+                job_id:
+                  type: string
+                message:
+                  type: string
+                status:
+                  type: string
+          400:
+            description: Invalid request
+        """
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'error': 'Missing request body'}), 400
+            
+            symbol = data.get('symbol')
+            timeframe = data.get('timeframe')
+            training_type = data.get('training_type')
+            config_version_id = data.get('config_version_id')  # Optional
+            
+            if not symbol or not timeframe or not training_type:
+                return jsonify({
+                    'error': 'Missing required fields: symbol, timeframe, training_type'
+                }), 400
+            
+            if training_type not in ['full', 'incremental']:
+                return jsonify({
+                    'error': 'training_type must be "full" or "incremental"'
+                }), 400
+            
+            # Create training pipeline with config version
+            pipeline = TrainingPipeline(config_version_id=config_version_id)
+            
+            # Trigger training in background thread
+            import threading
+            def train_worker():
+                try:
+                    if training_type == 'full':
+                        result = pipeline.full_retrain(symbol, timeframe)
+                    else:
+                        result = pipeline.incremental_train(symbol, timeframe)
+                    logger.info(f"Training completed: {result}")
+                except Exception as e:
+                    logger.error(f"Training failed: {e}", exc_info=True)
+            
+            thread = threading.Thread(target=train_worker, daemon=True)
+            thread.start()
+            
+            job_id = f"{symbol}-{timeframe}-{datetime.now().isoformat()}"
+            
+            return jsonify({
+                'job_id': job_id,
+                'message': f'Training {training_type} started for {symbol} {timeframe}',
+                'status': 'started',
+                'config_version_id': config_version_id or 'default'
+            })
+        except Exception as e:
+            logger.error(f"触发训练失败: {e}", exc_info=True)
+            return jsonify({'error': str(e)}), 500
+    
+    @app.route('/api/models/<model_version_id>/config', methods=['GET'])
+    def get_model_config(model_version_id):
+        """
+        获取模型使用的配置
+        ---
+        tags:
+          - Models
+        summary: Get config used for model
+        description: Returns the config version used to train a specific model
+        parameters:
+          - name: model_version_id
+            in: path
+            type: string
+            required: true
+            description: Model version ID
+          - name: symbol
+            in: query
+            type: string
+            required: true
+            description: Trading pair symbol
+          - name: timeframe
+            in: query
+            type: string
+            required: true
+            description: Timeframe
+        responses:
+          200:
+            description: Config version info
+            schema:
+              type: object
+              properties:
+                config_version_id:
+                  type: string
+                config:
+                  type: object
+                  additionalProperties:
+                    type: string
+          404:
+            description: Model or config not found
+        """
+        try:
+            symbol = request.args.get('symbol')
+            timeframe = request.args.get('timeframe')
+            
+            if not symbol or not timeframe:
+                return jsonify({
+                    'error': 'Missing required query parameters: symbol, timeframe'
+                }), 400
+            
+            config_dict = get_config_for_model(model_version_id, symbol, timeframe)
+            
+            if config_dict is None:
+                return jsonify({
+                    'config_version_id': 'default',
+                    'message': 'Model not linked to any config version, using defaults'
+                })
+            
+            # Parse JSON values
+            parsed_config = {}
+            for key, value_json in config_dict.items():
+                try:
+                    parsed_config[key] = json.loads(value_json)
+                except (json.JSONDecodeError, TypeError):
+                    parsed_config[key] = value_json
+            
+            # Find config_version_id from model_config_links
+            from config_registry import _default_db_path, _get_conn, _init_database
+            db_path = _default_db_path()
+            _init_database(db_path)
+            with _get_conn(db_path) as conn:
+                cur = conn.execute(
+                    "SELECT config_version_id FROM model_config_links WHERE model_version_id = ? AND symbol = ? AND timeframe = ?",
+                    (model_version_id, symbol, timeframe)
+                )
+                row = cur.fetchone()
+                config_version_id = row[0] if row else 'default'
+            
+            return jsonify({
+                'config_version_id': config_version_id,
+                'config': parsed_config
+            })
+        except Exception as e:
+            logger.error(f"获取模型配置失败: {e}", exc_info=True)
             return jsonify({'error': str(e)}), 500
     
     @app.route('/api/batch_predict', methods=['POST'])

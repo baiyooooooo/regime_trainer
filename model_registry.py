@@ -39,6 +39,29 @@ def _init_database(db_path: str) -> None:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (symbol, timeframe)
             );
+            CREATE TABLE IF NOT EXISTS training_configs (
+                config_version_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                created_by TEXT,
+                description TEXT,
+                is_active INTEGER DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS training_config_data (
+                config_version_id TEXT NOT NULL,
+                config_key TEXT NOT NULL,
+                config_value TEXT NOT NULL,
+                PRIMARY KEY (config_version_id, config_key),
+                FOREIGN KEY (config_version_id) REFERENCES training_configs(config_version_id)
+            );
+            CREATE TABLE IF NOT EXISTS model_config_links (
+                model_version_id TEXT NOT NULL,
+                config_version_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (model_version_id, symbol, timeframe),
+                FOREIGN KEY (config_version_id) REFERENCES training_configs(config_version_id)
+            );
         """)
         conn.commit()
 
@@ -236,6 +259,7 @@ def list_versions(
     """
     List all version_ids and which (symbol, timeframe) each contains.
     Optionally include which (symbol, timeframe) are PROD and their version.
+    Also includes config_version_id for each model if available.
     """
     models_dir = models_dir or _default_models_dir()
     db_path = db_path or _default_db_path()
@@ -257,6 +281,15 @@ def list_versions(
         with _get_conn(db_path) as conn:
             for row in conn.execute("SELECT version_id, created_at FROM model_versions"):
                 version_created[row[0]] = row[1]
+    
+    # Load config version mappings for all models
+    config_map = {}  # {(model_version_id, symbol, timeframe): config_version_id}
+    if os.path.isfile(db_path):
+        with _get_conn(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            for row in conn.execute("SELECT model_version_id, symbol, timeframe, config_version_id FROM model_config_links"):
+                config_map[(row["model_version_id"], row["symbol"], row["timeframe"])] = row["config_version_id"]
+    
     for vname in sorted(os.listdir(models_dir), reverse=True):
         vpath = os.path.join(models_dir, vname)
         if not os.path.isdir(vpath):
@@ -270,10 +303,19 @@ def list_versions(
                 tf_path = os.path.join(sym_path, tf)
                 if os.path.isdir(tf_path):
                     is_prod = prod_map.get((sym, tf), {}).get("version_id") == vname
-                    symbols.append({"symbol": sym, "timeframe": tf, "is_prod": is_prod})
+                    config_version_id = config_map.get((vname, sym, tf))
+                    model_info = {
+                        "symbol": sym,
+                        "timeframe": tf,
+                        "is_prod": is_prod
+                    }
+                    if config_version_id:
+                        model_info["config_version_id"] = config_version_id
+                    symbols.append(model_info)
         result.append({
             "version_id": vname,
             "created_at": version_created.get(vname),
-            "symbols": symbols,
+            "symbols": symbols,  # Keep for backward compatibility
+            "contents": symbols,  # Frontend expects 'contents'
         })
     return result

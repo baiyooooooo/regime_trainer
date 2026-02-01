@@ -1,13 +1,18 @@
 import { useState, useEffect } from 'react'
-import { RefreshCw, CheckCircle, XCircle } from 'lucide-react'
+import { RefreshCw, CheckCircle, XCircle, Settings, X } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import {
   listVersions,
   listAvailableModels,
   listModelsByTimeframe,
   getProdVersion,
   setProdVersion,
+  getModelConfig,
+  getConfigVersion,
   type ModelVersion,
+  type ConfigData,
 } from '../api/services'
+import TrainingTrigger from '../components/TrainingTrigger'
 
 export default function Models() {
   const [versions, setVersions] = useState<ModelVersion[]>([])
@@ -17,6 +22,11 @@ export default function Models() {
   const [selectedSymbol, setSelectedSymbol] = useState('BTCUSDT')
   const [selectedTimeframe, setSelectedTimeframe] = useState('15m')
   const [prodInfo, setProdInfo] = useState<any>(null)
+  const [configLinks, setConfigLinks] = useState<Record<string, string>>({})
+  const [showConfigModal, setShowConfigModal] = useState(false)
+  const [selectedConfigVersion, setSelectedConfigVersion] = useState<string | null>(null)
+  const [selectedConfigData, setSelectedConfigData] = useState<ConfigData | null>(null)
+  const [loadingConfig, setLoadingConfig] = useState(false)
 
   useEffect(() => {
     fetchData()
@@ -39,6 +49,24 @@ export default function Models() {
       setVersions(versionsData.versions)
       setAvailableModels(availableData.available_models)
       setModelsByTimeframe(timeframeData)
+      
+      // Fetch config links for each version
+      const links: Record<string, string> = {}
+      for (const version of versionsData.versions) {
+        const contents = version.contents || version.symbols || []  // Support both field names
+        for (const content of contents) {
+          try {
+            const configInfo = await getModelConfig(version.version_id, content.symbol, content.timeframe)
+            if (configInfo.config_version_id && configInfo.config_version_id !== 'default') {
+              const key = `${version.version_id}-${content.symbol}-${content.timeframe}`
+              links[key] = configInfo.config_version_id
+            }
+          } catch (err) {
+            // Config not linked, skip
+          }
+        }
+      }
+      setConfigLinks(links)
     } catch (error) {
       console.error('Failed to fetch models:', error)
     } finally {
@@ -64,6 +92,21 @@ export default function Models() {
     } catch (error) {
       console.error('Failed to set PROD:', error)
       alert('Failed to set PROD version')
+    }
+  }
+
+  const handleViewConfig = async (configVersionId: string) => {
+    try {
+      setLoadingConfig(true)
+      setSelectedConfigVersion(configVersionId)
+      const configData = await getConfigVersion(configVersionId)
+      setSelectedConfigData(configData)
+      setShowConfigModal(true)
+    } catch (error) {
+      console.error('Failed to load config:', error)
+      alert('Failed to load config details')
+    } finally {
+      setLoadingConfig(false)
     }
   }
 
@@ -116,6 +159,11 @@ export default function Models() {
         </div>
       </div>
 
+      {/* Model Training */}
+      <div className="card mb-6">
+        <TrainingTrigger onTrainingStarted={fetchData} />
+      </div>
+
       {/* PROD Management */}
       <div className="card mb-6">
         <h2 className="text-xl font-semibold text-white mb-4">PROD Version Management</h2>
@@ -165,10 +213,11 @@ export default function Models() {
         <h2 className="text-xl font-semibold text-white mb-4">All Versions</h2>
         <div className="space-y-4">
           {versions.map((version) => {
-            const hasProd = version.contents.some(
+            const contents = version.contents || version.symbols || []  // Support both field names
+            const hasProd = contents.some(
               (c) => c.symbol === selectedSymbol && c.timeframe === selectedTimeframe && c.is_prod
             )
-            const hasModel = version.contents.some(
+            const hasModel = contents.some(
               (c) => c.symbol === selectedSymbol && c.timeframe === selectedTimeframe
             )
 
@@ -190,19 +239,43 @@ export default function Models() {
                 </div>
                 <div className="mt-2">
                   <p className="text-sm text-slate-400 mb-1">Contents:</p>
-                  <div className="flex flex-wrap gap-2">
-                    {version.contents.map((content, idx) => (
-                      <span
-                        key={idx}
-                        className={`px-2 py-1 rounded text-xs ${
-                          content.is_prod
-                            ? 'bg-green-600 text-white'
-                            : 'bg-slate-600 text-slate-300'
-                        }`}
-                      >
-                        {content.symbol} {content.timeframe}
-                      </span>
-                    ))}
+                  <div className="space-y-2">
+                    {contents.map((content, idx) => {
+                      const configKey = `${version.version_id}-${content.symbol}-${content.timeframe}`
+                      const configVersionId = configLinks[configKey]
+                      return (
+                        <div key={idx} className="flex items-center gap-2 flex-wrap">
+                          <span
+                            className={`px-2 py-1 rounded text-xs ${
+                              content.is_prod
+                                ? 'bg-green-600 text-white'
+                                : 'bg-slate-600 text-slate-300'
+                            }`}
+                          >
+                            {content.symbol} {content.timeframe}
+                          </span>
+                          {configVersionId ? (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.preventDefault()
+                                e.stopPropagation()
+                                handleViewConfig(configVersionId)
+                              }}
+                              className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-blue-600 text-white hover:bg-blue-700 cursor-pointer transition-colors"
+                              title={`Click to view config: ${configVersionId}`}
+                            >
+                              <Settings size={12} />
+                              Config: {configVersionId}
+                            </button>
+                          ) : (
+                            <span className="px-2 py-1 rounded text-xs bg-gray-600 text-gray-300" title="Using default config">
+                              Default Config
+                            </span>
+                          )}
+                        </div>
+                      )
+                    })}
                   </div>
                 </div>
                 {hasModel && !hasProd && (
@@ -218,6 +291,61 @@ export default function Models() {
           })}
         </div>
       </div>
+
+      {/* Config Detail Modal */}
+      {showConfigModal && selectedConfigVersion && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => {
+          setShowConfigModal(false)
+          setSelectedConfigVersion(null)
+          setSelectedConfigData(null)
+        }}>
+          <div className="bg-white rounded-lg p-6 max-w-4xl w-full max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-bold text-black">Config: {selectedConfigVersion}</h2>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowConfigModal(false)
+                  setSelectedConfigVersion(null)
+                  setSelectedConfigData(null)
+                }}
+                className="text-gray-600 hover:text-gray-800"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            {loadingConfig ? (
+              <div className="text-center py-8 text-black">Loading config...</div>
+            ) : selectedConfigData ? (
+              <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
+                <pre className="text-xs overflow-x-auto text-black font-mono">
+                  {JSON.stringify(selectedConfigData, null, 2)}
+                </pre>
+              </div>
+            ) : (
+              <div className="text-center py-8 text-black">Failed to load config data</div>
+            )}
+            <div className="mt-4 flex gap-2 justify-end">
+              <Link
+                to={`/configs`}
+                className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+              >
+                Go to Config Management
+              </Link>
+              <button
+                onClick={() => {
+                  setShowConfigModal(false)
+                  setSelectedConfigVersion(null)
+                  setSelectedConfigData(null)
+                }}
+                className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 text-black"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

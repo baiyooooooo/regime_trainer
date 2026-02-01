@@ -25,6 +25,8 @@ from config import TrainingConfig, setup_logging
 from model_api import ModelAPI, create_app
 from scheduler import TrainingScheduler
 from forward_testing import ForwardTestCronManager
+from config_registry import list_config_versions, init_from_config_file
+import os
 
 # 配置日志
 setup_logging(log_file='server.log', level=logging.INFO)
@@ -35,6 +37,25 @@ def main():
     """主函数 - 启动 API 服务器和训练调度器"""
     # 确保目录存在
     TrainingConfig.ensure_dirs()
+    
+    # Check for config initialization
+    configs = list_config_versions()
+    auto_init = os.getenv('AUTO_INIT_CONFIG', 'false').lower() == 'true'
+    
+    if len(configs) == 0:
+        if auto_init:
+            logger.info("No configs found, auto-initializing from TrainingConfig...")
+            try:
+                config_version_id = init_from_config_file('Auto-initialized on server startup')
+                logger.info(f"✅ Config initialized: {config_version_id}")
+            except Exception as e:
+                logger.warning(f"Failed to auto-initialize config: {e}")
+        else:
+            logger.info("No configs found in database. Using TrainingConfig defaults.")
+            logger.info("To initialize configs, use POST /api/configs/init or set AUTO_INIT_CONFIG=true")
+    else:
+        logger.info(f"Using database configs ({len(configs)} versions available)")
+        logger.info("Note: POST /api/configs/init will always create a new version from TrainingConfig")
     
     # 初始化 API
     api = ModelAPI()
